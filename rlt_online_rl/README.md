@@ -259,8 +259,18 @@ cd openpi-RLT
 python scripts/serve_rlt_policy.py \
   --config rlt_pi05_agilexbag_image_delta_joint \
   --checkpoint-dir <checkpoint-dir> \
-  --port 8000
+  --port 8000 \
+  --shared-prefix-inference
 ```
+
+`--shared-prefix-inference` is an inference-only latency optimization for the
+Machine A server. Machine A needs both `z_rl` and the frozen VLA `ref_chunk`;
+the legacy path computes the VLA prefix once for `z_rl` and again inside action
+sampling to build the KV cache. With this flag, the server computes the prefix
+once and reuses the same prefix output/KV cache for both outputs. It does not
+change training, checkpoints, model weights, normalization, or the online RL
+runtime payload. Omit the flag to keep the legacy inference path for strict
+reproduction.
 
 For local integration tests without the real VLA server:
 

@@ -72,8 +72,11 @@ class RLTInferenceModel(nnx.Module):
         rlt_config: RLTokenConfig,
         rngs: nnx.Rngs,
         prefix_seq_len: int = 768,
+        *,
+        shared_prefix_inference: bool = False,
     ):
         self.vla = vla_model
+        self.shared_prefix_inference = shared_prefix_inference
         linen_rlt = RLTokenModel(config=rlt_config)
         self.rlt_module = nnx_bridge.ToNNX(linen_rlt)
         dummy_prefix = jnp.zeros((1, prefix_seq_len, rlt_config.input_dim))
@@ -88,10 +91,24 @@ class RLTInferenceModel(nnx.Module):
             actions: [batch, action_horizon, action_dim] VLA action chunks
             rl_token: [batch, num_rl_tokens, embed_dim] compressed RL token
         """
-        prefix_embs, prefix_mask = self.vla.extract_prefix_embeddings(rng, observation, train=False, image_only=True)
+        if self.shared_prefix_inference:
+            return self._infer_shared_prefix(rng, observation)
+        return self._infer_legacy(rng, observation)
+
+    def _infer_legacy(self, rng: at.KeyArrayLike, observation: _model.Observation) -> tuple[jnp.ndarray, jnp.ndarray]:
+        prefix_embs, _ = self.vla.extract_prefix_embeddings(rng, observation, train=False, image_only=True)
         prefix_f32 = prefix_embs.astype(jnp.float32)
         rl_token = self.rlt_module(prefix_f32, None, method="encode", train=False)
         actions = self.vla.sample_actions(rng, observation)
+        return actions, rl_token
+
+    def _infer_shared_prefix(
+        self, rng: at.KeyArrayLike, observation: _model.Observation
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        prefix_cache = self.vla.prepare_prefix_for_inference(observation)
+        prefix_f32 = prefix_cache.image_prefix_out.astype(jnp.float32)
+        rl_token = self.rlt_module(prefix_f32, None, method="encode", train=False)
+        actions = self.vla.sample_actions_from_prefix_cache(rng, prefix_cache)
         return actions, rl_token
 
 
@@ -270,6 +287,8 @@ class RLTPolicy(_base_policy.BasePolicy):
 def load_rlt_model(
     config: _config.TrainConfig,
     checkpoint_dir: str,
+    *,
+    shared_prefix_inference: bool = False,
 ) -> RLTInferenceModel:
     """Load RLT model from checkpoint."""
     checkpoint_path = pathlib.Path(checkpoint_dir)
@@ -281,7 +300,13 @@ def load_rlt_model(
     logging.info(f"RLT config: {rlt_config}, prefix_seq_len: {prefix_seq_len}")
 
     vla_model = nnx.eval_shape(config.model.create, jax.random.key(0))
-    model = RLTInferenceModel(vla_model, rlt_config, rngs=nnx.Rngs(jax.random.key(0)), prefix_seq_len=prefix_seq_len)
+    model = RLTInferenceModel(
+        vla_model,
+        rlt_config,
+        rngs=nnx.Rngs(jax.random.key(0)),
+        prefix_seq_len=prefix_seq_len,
+        shared_prefix_inference=shared_prefix_inference,
+    )
 
     logging.info(f"Loading params from {params_path}")
     loaded_params = _model.restore_params(params_path, dtype=jnp.bfloat16)
@@ -303,6 +328,7 @@ class Args:
     checkpoint_dir: str = ""
     port: int = 8000
     default_prompt: str | None = None
+    shared_prefix_inference: bool = False
 
 
 def main(args: Args) -> None:
@@ -312,7 +338,11 @@ def main(args: Args) -> None:
     if config.rlt_num_tokens is None:
         raise ValueError("Config must have RLT fields set.")
 
-    model = load_rlt_model(config, args.checkpoint_dir)
+    model = load_rlt_model(
+        config,
+        args.checkpoint_dir,
+        shared_prefix_inference=args.shared_prefix_inference,
+    )
 
     data_config = config.data.create(config.assets_dirs, config.model)
     checkpoint_path = pathlib.Path(args.checkpoint_dir)
@@ -348,6 +378,7 @@ def main(args: Args) -> None:
             "chunk_len": CHUNK_LEN,
             "action_dim": ACTION_DIM,
             "supports_batch": True,
+            "shared_prefix_inference": args.shared_prefix_inference,
         },
     )
 
