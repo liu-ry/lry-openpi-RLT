@@ -42,6 +42,11 @@ IMAGE_KEYS = (
     "right_wrist_0_rgb",
 )
 
+# Optional tactile image keys (used when Pi0Config.use_tactile=True)
+TACTILE_KEYS = (
+    "left1_tactile_rgb",
+    "left2_tactile_rgb",
+)
 
 # This may need change if we release a small model.
 IMAGE_RESOLUTION = (224, 224)
@@ -148,10 +153,15 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    use_tactile: bool = False,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
     """
+
+    image_keys = list(image_keys)
+    if use_tactile:
+        image_keys.extend(TACTILE_KEYS)
 
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
@@ -170,7 +180,7 @@ def preprocess_observation(
             image = image / 2.0 + 0.5
 
             transforms = []
-            if "wrist" not in key:
+            if "wrist" not in key and "tactile" not in key:
                 height, width = image.shape[1:3]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),

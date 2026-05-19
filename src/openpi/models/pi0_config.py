@@ -32,6 +32,9 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Whether to use tactile images (left1_tactile_rgb, left2_tactile_rgb) as additional inputs.
+    use_tactile: bool = False
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -65,18 +68,27 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        images = {
+            "base_0_rgb": image_spec,
+            "left_wrist_0_rgb": image_spec,
+            "right_wrist_0_rgb": image_spec,
+        }
+        image_masks = {
+            "base_0_rgb": image_mask_spec,
+            "left_wrist_0_rgb": image_mask_spec,
+            "right_wrist_0_rgb": image_mask_spec,
+        }
+
+        # Add tactile image specs if use_tactile is enabled.
+        if self.use_tactile:
+            for key in _model.TACTILE_KEYS:
+                images[key] = image_spec
+                image_masks[key] = image_mask_spec
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images=images,
+                image_masks=image_masks,
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),

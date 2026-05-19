@@ -24,6 +24,7 @@ import openpi.policies.agilexbag_image_policy as agilexbag_image_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.vitai_policy as vitai_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -424,6 +425,65 @@ class LerobotAgilexBagImageDataConfig(DataConfigFactory):
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotViTaiDataConfig(DataConfigFactory):
+    """Data config for ViTai robot with optional tactile images."""
+
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    use_xdof_bool_mask: bool = False
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # 新数据集图像 key 映射 (dataset_key → internal_key)
+                        "images": {
+                            "cam_top":       "observation.images.cam_top",
+                            "cam_wrist":     "observation.images.cam_wrist",
+                            "tactile_left":  "observation.images.tactile_left",
+                            "tactile_right": "observation.images.tactile_right",
+                        },
+                        "state":   "observation.state",
+                        "actions": "actions",  # 数据集中存储的 key 为 "actions"
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("actions",)  # 与数据集中的 key 保持一致
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[vitai_policy.ViTaiInputs(action_dim=model_config.action_dim)],
+            outputs=[vitai_policy.ViTaiOutputs()],
+        )
+
+        if self.use_delta_joint_actions:
+            if self.use_xdof_bool_mask:
+                # 全绝对值模式：7维全为 False (gripper + 6 joints 都不做 delta)
+                delta_action_mask = _transforms.make_bool_mask(-6, -1)
+            else:
+                # 标准模式：前6维(关节)做delta，最后1维(夹爪)保持绝对值
+                delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
@@ -1099,9 +1159,106 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    
+    
+    
+    
+    #
+    # Fine-tuning ViTai configs.
+    #
+    TrainConfig(
+        name="pi0_vitai_lora_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotViTaiDataConfig(
+            repo_id="/home/lry/temp/sync/converted",
+            assets=AssetsConfig(
+                asset_id="/home/lry/temp/sync/converted/assets",
+            ),
+            default_prompt="pick and place",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_top":   "observation.images.cam_top",
+                                "cam_wrist": "observation.images.cam_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10,
+        batch_size=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        keep_period=2,
+        wandb_enabled=True,
+        num_workers=4,
+    ),
     #
     # RLT (Representation Learning Token) configs.
     #
+    # RLT Stage1：在 LoRA 微调后的 ViTai checkpoint 上附加 RL-Token 模块。
+    # 注意：model 结构必须与 LoRA 微调时一致（gemma_2b_lora + gemma_300m_lora）。
+    # 使用前将 weight_loader 路径中的 STEP 换成实际训练步数，例如：
+    #   ./checkpoints/pi0_vitai_low_mem_finetune/vitai_lora_exp1/100000/params
+    TrainConfig(
+        name="rlt_pi0_vitai_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotViTaiDataConfig(
+            repo_id="/home/lry/temp/sync/converted",
+            assets=AssetsConfig(
+                asset_id="/home/lry/temp/sync/converted/assets",
+            ),
+            default_prompt="pick and place",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_top":   "observation.images.cam_top",
+                                "cam_wrist": "observation.images.cam_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi0_vitai_lora_finetune/vitai_lora_exp1/STEP/params"
+        ),
+        num_train_steps=5_000,
+        batch_size=8,
+        keep_period=5000,
+        wandb_enabled=False,
+        # Stage1：VLA 完全冻结，只训练 rlt_module
+        rlt_alpha=0.0,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+    ),
     TrainConfig(
         name="debug_rlt",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),

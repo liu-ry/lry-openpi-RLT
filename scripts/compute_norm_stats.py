@@ -111,7 +111,10 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # Use asset_id as the save path if provided, otherwise fall back to repo_id.
+    # This allows configs to specify a custom output directory via AssetsConfig(asset_id=...).
+    save_key = data_config.asset_id if data_config.asset_id is not None else data_config.repo_id
+    output_path = config.assets_dirs / save_key
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
