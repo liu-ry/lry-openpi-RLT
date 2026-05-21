@@ -384,9 +384,12 @@ def main(args: Args) -> None:
 
     # Test single inference
     logging.info("Testing single inference...")
-    fake_obs = config.model.fake_obs(batch_size=1)
+    # Use data-level keys that vitai_policy.infer() expects (cam_top, cam_wrist)
     fake_dict = {
-        "images": {k: np.asarray(v[0]) for k, v in fake_obs.images.items()},
+        "images": {
+            "cam_top":   np.zeros((224, 224, 3), dtype=np.uint8),
+            "cam_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
+        },
         "state": np.zeros(PROPRIO_DIM, dtype=np.float32),
         "prompt": "test prompt",
     }

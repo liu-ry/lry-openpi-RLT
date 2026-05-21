@@ -39,7 +39,6 @@ class ModelType(enum.Enum):
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
-    "right_wrist_0_rgb",
 )
 
 # Optional tactile image keys (used when Pi0Config.use_tactile=True)

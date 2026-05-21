@@ -1167,16 +1167,16 @@ _CONFIGS = [
     # Fine-tuning ViTai configs.
     #
     TrainConfig(
-        name="pi0_vitai_lora_finetune",
+        name="pi05_vitai_lora_finetune",
         model=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotViTaiDataConfig(
-            repo_id="/home/lry/temp/sync/converted",
+            repo_id="/liury/src/lry-openpi-RLT/data/sync/converted",
             assets=AssetsConfig(
-                asset_id="/home/lry/temp/sync/converted/assets",
+                asset_id="/liury/src/lry-openpi-RLT/data/sync/converted/assets",
             ),
             default_prompt="pick and place",
             repack_transforms=_transforms.Group(
@@ -1196,15 +1196,15 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=10,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+        num_train_steps=1000,
         batch_size=8,
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
         keep_period=2,
-        wandb_enabled=True,
+        wandb_enabled=False,
         num_workers=4,
     ),
     #
@@ -1213,18 +1213,18 @@ _CONFIGS = [
     # RLT Stage1：在 LoRA 微调后的 ViTai checkpoint 上附加 RL-Token 模块。
     # 注意：model 结构必须与 LoRA 微调时一致（gemma_2b_lora + gemma_300m_lora）。
     # 使用前将 weight_loader 路径中的 STEP 换成实际训练步数，例如：
-    #   ./checkpoints/pi0_vitai_low_mem_finetune/vitai_lora_exp1/100000/params
+    #   ./checkpoints/pi05_vitai_low_mem_finetune/vitai_lora_exp1/100000/params
     TrainConfig(
-        name="rlt_pi0_vitai_lora",
+        name="rlt_pi05_vitai_lora",
         model=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotViTaiDataConfig(
-            repo_id="/home/lry/temp/sync/converted",
+            repo_id="/liury/src/lry-openpi-RLT/data/sync/converted",
             assets=AssetsConfig(
-                asset_id="/home/lry/temp/sync/converted/assets",
+                asset_id="/liury/src/lry-openpi-RLT/data/sync/converted/assets",
             ),
             default_prompt="pick and place",
             repack_transforms=_transforms.Group(
@@ -1246,9 +1246,9 @@ _CONFIGS = [
         ),
         # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi0_vitai_lora_finetune/vitai_lora_exp1/STEP/params"
+            "/liury/src/lry-openpi-RLT/checkpoints/pi05_vitai_lora_finetune/pi05_vitai_lora_finetune_1/999/params"
         ),
-        num_train_steps=5_000,
+        num_train_steps=1_000,
         batch_size=8,
         keep_period=5000,
         wandb_enabled=False,
