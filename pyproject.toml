@@ -138,4 +138,3 @@ build-backend = "hatchling.build"
 markers = ["manual: should be run manually."]
 testpaths = ["src", "scripts", "packages"]
 
-exclude-dependencies = ["rerun-sdk"]

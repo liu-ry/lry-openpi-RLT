@@ -295,6 +295,11 @@ class ActorService:
         self._poll_thread: threading.Thread | None = None
         self._logged_missing_params = False
         self._packer = msgpack_numpy.Packer()
+        # Eagerly load the snapshot on construction so that infer() is ready
+        # immediately after __init__ returns, without having to wait for the
+        # first poll-interval tick (which includes a JAX JIT warm-up that can
+        # take several seconds on first call).
+        self._try_reload_snapshot()
         self._start_param_poller()
 
     def infer(self, request: ActorRequest) -> ActorResponse:
@@ -1426,18 +1431,43 @@ class EnvDriver:
             )
             return next_obs, list(rewards), bool(done), dict(info)
 
+        # 非execute_chunk环境的回退实现：逐步执行计划中的动作，并积累奖励和轨迹信息。
         plan = policy_planner(observation, 0)
         action_chunk = np.asarray(plan.action_chunk, dtype=np.float32)
+        ref_chunk = np.asarray(plan.ref_chunk, dtype=np.float32)
         rewards: list[float] = []
         done = False
         info: dict[str, Any] = {}
         next_obs: dict[str, Any] | None = None
-        for action in action_chunk[: self._env_config.chunk_exec_horizon]:
+        step_trace: list[dict[str, Any]] = []
+        current_obs = observation
+        for local_step, action in enumerate(action_chunk[: self._env_config.chunk_exec_horizon]):
             next_obs, reward, terminated, truncated, info = self._env.step(action)
             rewards.append(float(reward))
             done = bool(terminated or truncated)
+            ref_action = ref_chunk[local_step] if local_step < len(ref_chunk) else ref_chunk[-1]
+            step_trace.append(
+                {
+                    "observation": current_obs,
+                    "action": action,
+                    "ref_action": ref_action,
+                    "reward": float(reward),
+                    "next_observation": next_obs,
+                    "done": done,
+                    "source": int(plan.source),
+                    "human_controlled": False,
+                    "actor_param_version": int(plan.actor_param_version),
+                }
+            )
+            current_obs = next_obs
             if done:
                 break
         if next_obs is None:
             raise RuntimeError("Environment did not produce a next observation.")
-        return next_obs, rewards, done, dict(info)
+        combined_info = dict(info)
+        # Provide step_trace so _build_trace_records can build per-step replay records.
+        # Without this, trace_records would be empty and raw_positions would not be
+        # populated, causing a KeyError when building chunk replay windows.
+        if "step_trace" not in combined_info:
+            combined_info["step_trace"] = step_trace
+        return next_obs, rewards, done, combined_info
