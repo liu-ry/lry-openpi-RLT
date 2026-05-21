@@ -96,6 +96,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--phase", choices=PHASE_CHOICES, default="all")
     parser.add_argument("--source", choices=tuple(SOURCE_CHOICES), default="all")
     parser.add_argument("--output-dir", type=Path, default=None, help="Optional offline output directory.")
+    parser.add_argument(
+        "--rl-config-path",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a task YAML config (e.g. configs/tasks/dobot_umi/dobot_umi.yaml). "
+            "When provided, rl_config is loaded from the YAML instead of actor_snapshot.pkl. "
+            "Use this when no snapshot exists yet (first offline training run)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -106,6 +116,34 @@ def _load_snapshot_config(task_dir: Path) -> RLTOnlineRLConfig:
     cfg = RLTOnlineRLConfig(**payload["rl_config"])
     cfg = resolve_rl_config_paths(cfg, str(snapshot_path), require_exists=True)
     return dataclasses.replace(cfg, action_norm_stats_path=resolve_stats_path(cfg.action_norm_stats_path, task_dir))
+
+
+def _load_yaml_config(config_path: Path) -> RLTOnlineRLConfig:
+    """Load RLTOnlineRLConfig directly from a task YAML file (no snapshot required)."""
+    import yaml
+    with config_path.open(encoding="utf-8") as f:
+        payload = yaml.safe_load(f) or {}
+    rl_payload = payload.get("experiment", {}).get("rl", {})
+    # YAML parses scientific notation like 1e-4 as str; coerce numeric fields to correct Python types
+    fields = RLTOnlineRLConfig.__dataclass_fields__
+    coerced: dict[str, Any] = {}
+    for k, v in rl_payload.items():
+        if k not in fields:
+            continue
+        ft = fields[k].type
+        # float fields: lr, std, weights, etc.
+        if ft in ("float", float) or (isinstance(ft, str) and "float" in ft):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                pass
+        coerced[k] = v
+    cfg = RLTOnlineRLConfig(**coerced)
+    # Resolve action_norm_stats_path relative to the config file's directory
+    if cfg.action_norm_stats_path is not None:
+        stats_path = config_path.parent / cfg.action_norm_stats_path
+        cfg = dataclasses.replace(cfg, action_norm_stats_path=str(stats_path.resolve()))
+    return cfg
 
 
 def _load_replay_records(path: Path) -> list[dict[str, Any]]:
@@ -691,7 +729,11 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    rl_config = _load_snapshot_config(task_dir)
+    if args.rl_config_path is not None:
+        rl_config = _load_yaml_config(args.rl_config_path.resolve())
+    else:
+        rl_config = _load_snapshot_config(task_dir)
+
     if args.actor_hidden_dim is not None:
         rl_config = dataclasses.replace(rl_config, actor_hidden_dim=args.actor_hidden_dim)
     if args.actor_num_layers is not None:
