@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 RUN_ONLINE_RL = REPO_ROOT / "scripts" / "run_online_rl.py"
 RUN_WANDB_MONITOR = REPO_ROOT / "scripts" / "stream_learner_metrics_to_wandb.py"
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "tasks" / "agilex_ethernet" / "online_rl.yaml"
+DOBOT_UMI_CONFIG = REPO_ROOT / "configs" / "tasks" / "dobot_umi" / "online_rl.yaml"
 
 
 def _parse_args() -> argparse.Namespace:

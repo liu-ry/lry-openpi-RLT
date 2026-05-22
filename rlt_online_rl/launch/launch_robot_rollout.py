@@ -15,7 +15,14 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 PIKA_SYNC_ROS = REPO_ROOT / "train_deploy_alignment" / "pika_sync_ros.py"
+DOBOT_UMI_ROS = REPO_ROOT / "train_deploy_alignment" / "dobot_umi_ros.py"
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "tasks" / "agilex_ethernet" / "online_rl.yaml"
+
+# 内置 ROS 脚本映射表，通过 --ros_script 选项引用
+_ROS_SCRIPTS: dict[str, Path] = {
+    "pika":      PIKA_SYNC_ROS,
+    "dobot_umi": DOBOT_UMI_ROS,
+}
 
 from rlt_online_rl.config import load_system_config_yaml
 
@@ -48,20 +55,35 @@ def _wait_for_http(url: str, *, timeout_sec: float = 30.0) -> None:
 
 def main() -> None:
     argv = sys.argv[1:]
+
+    # ── 解析 --ros_script（不传给 ROS 脚本本身，仅用于选择入口） ─────────────
+    ros_script_key = _peek_option(argv, "--ros_script")
+    if ros_script_key is not None:
+        # 从 argv 中移除 --ros_script <value> 这两个 token
+        idx = argv.index("--ros_script")
+        argv = argv[:idx] + argv[idx + 2:]
+        if ros_script_key in _ROS_SCRIPTS:
+            ros_script = _ROS_SCRIPTS[ros_script_key]
+        else:
+            ros_script = Path(ros_script_key).expanduser().resolve()
+    else:
+        ros_script = PIKA_SYNC_ROS   # 默认行为，向后兼容
+
     config_path = _peek_option(argv, "--config") or str(DEFAULT_CONFIG)
     system = load_system_config_yaml(config_path)
 
     actor_service_url = _peek_option(argv, "--actor_service_url") or system.env_driver.actor_service_url
     replay_service_url = _peek_option(argv, "--replay_service_url") or system.env_driver.replay_service_url
 
+    print(f"[launch_robot_rollout] ros_script={ros_script.name}", flush=True)
     print(f"[launch_robot_rollout] waiting for actor_service at {actor_service_url}", flush=True)
     _wait_for_http(f"{actor_service_url.rstrip('/')}/version")
     print(f"[launch_robot_rollout] waiting for replay_manager at {replay_service_url}", flush=True)
     _wait_for_http(f"{replay_service_url.rstrip('/')}/stats")
-    print("[launch_robot_rollout] services ready, starting pika_sync_ros.", flush=True)
+    print(f"[launch_robot_rollout] services ready, starting {ros_script.name}.", flush=True)
 
     os.chdir(REPO_ROOT)
-    os.execv(sys.executable, [sys.executable, str(PIKA_SYNC_ROS), *argv])
+    os.execv(sys.executable, [sys.executable, str(ros_script), *argv])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  dobot_umi_inference:
+    build:
+      context: ../../
+      dockerfile: examples/dobot_umi/Dockerfile
+    network_mode: host
+    privileged: true
+    environment:
+      - ROS_DOMAIN_ID=0
+      - PYTHONPATH=/workspace/src:/workspace/packages/openpi-client/src
+    volumes:
+      - /dev:/dev
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    command: >
+      python examples/dobot_umi/main.py
+        --host ${POLICY_SERVER_HOST:-192.168.3.5}
+        --port ${POLICY_SERVER_PORT:-8000}
+        --task "${TASK_DESCRIPTION:-pick and place the object}"
+        --num_episodes ${NUM_EPISODES:-5}
