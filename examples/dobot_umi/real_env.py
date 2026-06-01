@@ -3,7 +3,7 @@
 硬件接入方式：
   - Dobot 机械臂：SDK 直驱（TCP/IP）
   - 知行夹爪：SDK 直驱（RS-485 串口）
-  - RealSense 相机：ROS 话题
+  - RealSense 相机：pyrealsense2 SDK 直驱（不依赖 ROS）
 
 Action space (7D):
     [joint1, joint2, joint3, joint4, joint5, joint6,  # 绝对关节角（rad）
@@ -59,12 +59,13 @@ class DobotUMIRealEnv:
         gripper_baudrate: int = constants.GRIPPER_BAUDRATE,
         gripper_speed_pct: int = constants.GRIPPER_SPEED_PCT,
         gripper_force_pct: int = constants.GRIPPER_FORCE_PCT,
-        # ROS 相机话题参数
-        init_ros_node: bool = True,
-        cam_front_topic: str = constants.CAM_FRONT_TOPIC,
-        cam_wrist_topic: str = constants.CAM_WRIST_TOPIC,
+        # RealSense 相机 SDK 参数
+        cam_front_serial: str = constants.REALSENSE_FRONT_SERIAL,
+        cam_wrist_serial: str = constants.REALSENSE_WRIST_SERIAL,
+        cam_width: int = constants.REALSENSE_WIDTH,
+        cam_height: int = constants.REALSENSE_HEIGHT,
+        cam_fps: int = constants.REALSENSE_FPS,
         image_resize_hw: tuple[int, int] | None = None,
-        align_image_timestamps: bool = True,
         obs_ready_timeout_s: float | None = 10.0,
         # 复位姿态
         reset_joint_positions: list[float] | None = None,
@@ -75,7 +76,6 @@ class DobotUMIRealEnv:
             else list(constants.DEFAULT_RESET_JOINT_POSITIONS)
         )
         self._image_resize_hw = image_resize_hw
-        self._align_timestamps = align_image_timestamps
 
         # ── 机械臂 SDK ────────────────────────────────────────────────────────
         self.arm = _utils.DobotSDKArm(
@@ -93,14 +93,15 @@ class DobotUMIRealEnv:
             force_pct=gripper_force_pct,
         )
 
-        # ── ROS 相机节点 ──────────────────────────────────────────────────────
-        import rclpy as _rclpy
-        if init_ros_node and not _rclpy.ok():
-            _rclpy.init()
-        self.image_recorder = _utils.DobotImageRecorder(
-            cam_front_topic=cam_front_topic,
-            cam_wrist_topic=cam_wrist_topic,
+        # ── RealSense 相机 SDK ────────────────────────────────────────────────
+        self.image_recorder = _utils.RealSenseImageRecorder(
+            serial_front=cam_front_serial,
+            serial_wrist=cam_wrist_serial,
+            width=cam_width,
+            height=cam_height,
+            fps=cam_fps,
         )
+        self.image_recorder.start()
 
         # 等待相机就绪
         if obs_ready_timeout_s is not None:
@@ -117,13 +118,17 @@ class DobotUMIRealEnv:
         self.gripper.init()
 
     def disconnect(self) -> None:
-        """安全断开机械臂和夹爪。"""
+        """安全断开机械臂、夹爪和相机。"""
         try:
             self.arm.disable()
         except Exception:
             pass
         self.arm.disconnect()
         self.gripper.release()
+        try:
+            self.image_recorder.stop()
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # 观测
@@ -139,7 +144,6 @@ class DobotUMIRealEnv:
         """返回包含 'cam_front' 和 'cam_wrist' 的 RGB uint8 图像字典。"""
         return self.image_recorder.get_images(
             resize_hw=self._image_resize_hw,
-            align_timestamps=self._align_timestamps,
         )
 
     def get_observation(self) -> dict[str, Any]:

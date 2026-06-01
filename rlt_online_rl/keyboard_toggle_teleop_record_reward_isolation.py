@@ -12,10 +12,25 @@ from train_deploy_alignment.manual_signal_bridge import RECORD_FAILURE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_SUCCESS_SERVICE
 from train_deploy_alignment.manual_signal_bridge import REQUEST_NEXT_EPISODE_SERVICE
 
-RL_TELEOP_TRIGGER_SERVICE = "/teleop_trigger_rl"
-HW_TELEOP_TRIGGER_SERVICE = "/teleop_trigger"
+RL_TELEOP_TRIGGER_SERVICE_DEFAULT = "/umi/teleop_trigger"
+HW_TELEOP_TRIGGER_SERVICE_DEFAULT = "/umi/teleop_trigger"
 TELEOP_STATUS_SERVICE = "/teleop_status"
 HW_TELEOP_SETTLE_SEC = 1.0
+
+
+def _parse_cli_args():
+    import argparse
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--rl_service", default=RL_TELEOP_TRIGGER_SERVICE_DEFAULT,
+                   help="RL 侧 teleop toggle 服务名（Pika 默认 /teleop_trigger_rl；"
+                        "Dobot+UMI 用 /umi/teleop_trigger）")
+    p.add_argument("--hw_service", default=HW_TELEOP_TRIGGER_SERVICE_DEFAULT,
+                   help="硬件侧 teleop toggle 服务名（Pika 默认 /teleop_trigger；"
+                        "Dobot+UMI 用 /umi/teleop_trigger）")
+    p.add_argument("--domain_id", type=int, default=9,
+                   help="ROS_DOMAIN_ID（UMI 默认 9）")
+    args, _ = p.parse_known_args()
+    return args
 
 
 def getch():
@@ -30,11 +45,11 @@ def getch():
 
 
 class KeyboardTeleopRecordRewardToggle(Node):
-    def __init__(self):
+    def __init__(self, rl_service: str, hw_service: str):
         super().__init__("keyboard_teleop_record_reward_toggle")
 
-        self.rl_teleop_cli = self.create_client(Trigger, RL_TELEOP_TRIGGER_SERVICE)
-        self.hw_teleop_cli = self.create_client(Trigger, HW_TELEOP_TRIGGER_SERVICE)
+        self.rl_teleop_cli = self.create_client(Trigger, rl_service)
+        self.hw_teleop_cli = self.create_client(Trigger, hw_service)
         self.teleop_status_cli = self.create_client(Trigger, TELEOP_STATUS_SERVICE)
         self.next_episode_cli = self.create_client(Trigger, REQUEST_NEXT_EPISODE_SERVICE)
         self.success_cli = self.create_client(Trigger, RECORD_SUCCESS_SERVICE)
@@ -42,9 +57,9 @@ class KeyboardTeleopRecordRewardToggle(Node):
         self.critical_phase_cli = self.create_client(Trigger, ENTER_CRITICAL_PHASE_SERVICE)
         self.control_mode = "unknown"
 
-        self.get_logger().info(f"Waiting for local teleop service {RL_TELEOP_TRIGGER_SERVICE}...")
+        self.get_logger().info(f"Waiting for local teleop service {rl_service}...")
         self.rl_teleop_cli.wait_for_service()
-        self.get_logger().info(f"Waiting for hardware teleop service {HW_TELEOP_TRIGGER_SERVICE}...")
+        self.get_logger().info(f"Waiting for hardware teleop service {hw_service}...")
         self.hw_teleop_cli.wait_for_service()
         self.get_logger().info(f"Waiting for {TELEOP_STATUS_SERVICE} service...")
         self.teleop_status_cli.wait_for_service()
@@ -108,7 +123,7 @@ class KeyboardTeleopRecordRewardToggle(Node):
             return True
         return False
 
-    def _call_trigger(self, client, failure_message: str, *, timeout_sec: float = 1.0):
+    def _call_trigger(self, client, failure_message: str, *, timeout_sec: float = 5.0):
         req = Trigger.Request()
         future = client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
@@ -168,6 +183,10 @@ class KeyboardTeleopRecordRewardToggle(Node):
             self.get_logger().warn(resp.message if resp.message else f"Recording {label} failed.")
         self.refresh_teleop_mode()
 
+    def _is_unified_service(self) -> bool:
+        """rl_service 和 hw_service 是同一个服务（如 Dobot+UMI 的 /umi/teleop_trigger）。"""
+        return self.rl_teleop_cli.srv_name == self.hw_teleop_cli.srv_name
+
     def toggle_teleop(self):
         if not self.refresh_teleop_mode():
             return
@@ -175,7 +194,11 @@ class KeyboardTeleopRecordRewardToggle(Node):
             self.get_logger().warn("Episode inactive/reset in progress; teleop toggle ignored.")
             return
 
-        if self.control_mode == "teleop":
+        if self._is_unified_service():
+            # 单服务模式（Dobot+UMI）：只调一次，服务内部同时处理 RL 暂停 + 对齐参考帧
+            if not self._toggle_local_teleop():
+                return
+        elif self.control_mode == "teleop":
             if not self._toggle_hardware_teleop(reason="teleop exit"):
                 return
             time.sleep(HW_TELEOP_SETTLE_SEC)
@@ -215,13 +238,19 @@ class KeyboardTeleopRecordRewardToggle(Node):
 
 
 def main():
-    rclpy.init()
-    node = KeyboardTeleopRecordRewardToggle()
+    cli = _parse_cli_args()
+    rclpy.init(domain_id=cli.domain_id)
+    node = KeyboardTeleopRecordRewardToggle(
+        rl_service=cli.rl_service,
+        hw_service=cli.hw_service,
+    )
 
     try:
         while rclpy.ok():
             ch = getch()
-            if ch == "t":
+            if ch in ("\x03", "\x04", "q"):  # Ctrl+C / Ctrl+D / q 均退出
+                break
+            elif ch == "t":
                 node.toggle_teleop()
             elif ch == "o":
                 node.request_next_episode()
@@ -231,8 +260,8 @@ def main():
                 node.record_failure()
             elif ch == "c":
                 node.enter_critical_phase()
-            elif ch == "q":
-                break
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()

@@ -25,10 +25,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import threading
 from pathlib import Path
+
+import numpy as np
 
 # ── 路径注入 ──────────────────────────────────────────────────────────────────
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +44,11 @@ for _p in (
 ):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# 确保 third_party 可作为包被识别（dobot_sdk/__init__.py 内部用了 third_party.dobot_sdk 前缀）
+_third_party_init = _REPO_ROOT / "third_party" / "__init__.py"
+if not _third_party_init.exists():
+    _third_party_init.touch()
 
 from examples.dobot_umi import constants
 
@@ -71,9 +79,9 @@ def check_dobot_arm(
 ) -> bool:
     print(_title("[1] 越疆 Dobot 机械臂"))
     try:
-        from dobot_sdk.dobot_api import DobotApiDashboard, DobotApiFeedBack
+        from dobot_api import DobotApiDashboard, DobotApiFeedBack  # noqa: PLC0415
     except ImportError:
-        print(_fail("Dobot SDK 导入失败，请确认 third_party/dobot_umi_sdk/ 存在"))
+        print(_fail("Dobot SDK 导入失败，请确认 third_party/dobot_umi_sdk/dobot_sdk/dobot_api.py 存在"))
         return False
 
     # ── Dashboard 连接 ────────────────────────────────────────────────────────
@@ -131,7 +139,8 @@ def check_dobot_arm(
             if data and hex(data["TestValue"][0]) == "0x123456789abcdef":
                 q = list(data["QActual"][0])
                 import math
-                q_deg = [round(math.degrees(v), 2) for v in q]
+                # QActual 单位已是度，直接显示，不需要 math.degrees() 转换
+                q_deg = [round(v, 2) for v in q]
                 print(_ok(f"FeedBack 关节角（°）: {q_deg}"))
             else:
                 print(_warn("FeedBack 数据校验未通过（TestValue 不匹配），可能固件版本差异"))
@@ -169,9 +178,9 @@ def check_gripper(
 ) -> bool:
     print(_title("[2] 知行夹爪（RS-485）"))
     try:
-        from adaptive_sdk.changingtek_p_rtu_Servo import MotorController
+        from changingtek_p_rtu_Servo import MotorController  # noqa: PLC0415
     except ImportError:
-        print(_fail("MotorController SDK 导入失败，请确认 third_party/dobot_umi_sdk/adaptive_sdk/ 存在"))
+        print(_fail("MotorController SDK 导入失败，请确认 third_party/dobot_umi_sdk/adaptive_sdk/changingtek_p_rtu_Servo.py 存在"))
         return False
 
     motor = None
@@ -232,70 +241,77 @@ def check_gripper(
 # 检测 3 & 4：RealSense 相机（ROS 话题）
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 检测 3 & 4：RealSense 相机（pyrealsense2 SDK 直驱）
+# ─────────────────────────────────────────────────────────────────────────────
+
 def check_cameras(
-    front_topic: str,
-    wrist_topic: str,
-    timeout_s: float = 8.0,
+    serial_front: str,
+    serial_wrist: str,
+    width: int = constants.REALSENSE_WIDTH,
+    height: int = constants.REALSENSE_HEIGHT,
+    fps: int = constants.REALSENSE_FPS,
 ) -> bool:
-    print(_title("[3] RealSense 相机（ROS 话题）"))
+    print(_title("[3] RealSense 相机（pyrealsense2 SDK）"))
     try:
-        import rclpy
-        from rclpy.node import Node
-        from rclpy.qos import qos_profile_sensor_data
-        from sensor_msgs.msg import Image as ROSImage
+        import pyrealsense2 as rs
     except ImportError:
-        print(_fail("rclpy 未安装，无法检测相机话题"))
+        print(_fail("pyrealsense2 未安装，请 pip install pyrealsense2"))
         return False
 
-    received = {"front": None, "wrist": None}
-    lock = threading.Lock()
+    # ── 枚举设备 ──────────────────────────────────────────────────────────────
+    ctx = rs.context()
+    connected = [d.get_info(rs.camera_info.serial_number) for d in ctx.query_devices()]
+    names     = {d.get_info(rs.camera_info.serial_number): d.get_info(rs.camera_info.name)
+                 for d in ctx.query_devices()}
+    print(f"   检测到 {len(connected)} 台 RealSense 设备: {connected}")
 
-    class _CamChecker(Node):
-        def __init__(self):
-            super().__init__("hw_check_cam")
-            qos = qos_profile_sensor_data
-            self.create_subscription(ROSImage, front_topic, self._on_front, qos)
-            self.create_subscription(ROSImage, wrist_topic, self._on_wrist, qos)
+    if not connected:
+        print(_fail("未检测到任何 RealSense 设备，请检查 USB 连接"))
+        return False
 
-        def _on_front(self, msg):
-            with lock:
-                if received["front"] is None:
-                    received["front"] = msg
-
-        def _on_wrist(self, msg):
-            with lock:
-                if received["wrist"] is None:
-                    received["wrist"] = msg
-
-    if not rclpy.ok():
-        rclpy.init()
-
-    node = _CamChecker()
-    executor = rclpy.executors.SingleThreadedExecutor()
-    executor.add_node(node)
-
-    print(f"   等待相机话题（最多 {timeout_s:.0f}s）...")
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        executor.spin_once(timeout_sec=0.1)
-        with lock:
-            if received["front"] is not None and received["wrist"] is not None:
-                break
+    # 解析正面 / 腕部序列号
+    front_sn = serial_front if serial_front else connected[0]
+    remaining = [s for s in connected if s != front_sn]
+    wrist_sn  = serial_wrist if serial_wrist else (remaining[0] if remaining else front_sn)
+    single_cam = (front_sn == wrist_sn)
 
     ok = True
-    with lock:
-        for key, topic in (("front", front_topic), ("wrist", wrist_topic)):
-            msg = received[key]
-            if msg is not None:
-                h = msg.height
-                w = msg.width
-                enc = msg.encoding
-                print(_ok(f"{topic}  →  {w}×{h}  encoding={enc}"))
-            else:
-                print(_fail(f"{topic}  →  {timeout_s:.0f}s 内未收到图像（检查相机是否启动）"))
-                ok = False
+    for label, sn in (("cam_front", front_sn), ("cam_wrist", wrist_sn)):
+        if single_cam and label == "cam_wrist":
+            print(_warn(f"cam_wrist  →  仅 1 台设备，与 cam_front 共用 (SN={sn})"))
+            continue
+        if sn not in connected:
+            print(_fail(f"{label}  →  序列号 {sn} 未连接"))
+            ok = False
+            continue
 
-    node.destroy_node()
+        pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_device(sn)
+        cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
+        try:
+            pipeline.start(cfg)
+            frames = pipeline.wait_for_frames(timeout_ms=3000)
+            color  = frames.get_color_frame()
+            if color:
+                img = np.asanyarray(color.get_data())
+                print(_ok(f"{label}  →  SN={sn}  {names.get(sn,'')}  "
+                           f"{img.shape[1]}×{img.shape[0]}  RGB8"))
+            else:
+                print(_fail(f"{label}  →  SN={sn} 未能获取彩色帧"))
+                ok = False
+        except Exception as e:
+            print(_fail(f"{label}  →  SN={sn} 采集失败: {e}"))
+            ok = False
+        finally:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+
+    if ok:
+        print(_ok("RealSense 相机检测通过"))
     return ok
 
 
@@ -306,12 +322,14 @@ def check_cameras(
 def check_umi(
     action_topic: str,
     timeout_s: float = 5.0,
+    domain_id: int = 9,
 ) -> bool:
     print(_title("[4] UMI 示教设备（ROS 话题）"))
     try:
         import rclpy
+        import rclpy.context
         from rclpy.node import Node
-        from sensor_msgs.msg import JointState
+        from geometry_msgs.msg import PoseStamped as ROSPoseStamped
     except ImportError:
         print(_fail("rclpy 未安装，无法检测 UMI 话题"))
         return False
@@ -319,24 +337,25 @@ def check_umi(
     received = [None]
     lock = threading.Lock()
 
+    # UMI 使用独立 Context + domain_id=9，与相机检测的 Context 互不干扰
+    umi_context = rclpy.context.Context()
+    rclpy.init(context=umi_context, domain_id=domain_id)
+
     class _UMIChecker(Node):
         def __init__(self):
-            super().__init__("hw_check_umi")
-            self.create_subscription(JointState, action_topic, self._on_action, 10)
+            super().__init__("hw_check_umi", context=umi_context)
+            self.create_subscription(ROSPoseStamped, action_topic, self._on_pose, 50)
 
-        def _on_action(self, msg):
+        def _on_pose(self, msg):
             with lock:
                 if received[0] is None:
                     received[0] = msg
 
-    if not rclpy.ok():
-        rclpy.init()
-
     node = _UMIChecker()
-    executor = rclpy.executors.SingleThreadedExecutor()
+    executor = rclpy.executors.SingleThreadedExecutor(context=umi_context)
     executor.add_node(node)
 
-    print(f"   等待 UMI 话题 {action_topic}（最多 {timeout_s:.0f}s）...")
+    print(f"   等待 UMI 话题 {action_topic}（ROS_DOMAIN_ID={domain_id}，最多 {timeout_s:.0f}s）...")
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         executor.spin_once(timeout_sec=0.1)
@@ -348,14 +367,19 @@ def check_umi(
     with lock:
         msg = received[0]
         if msg is not None:
-            import numpy as np
-            action = list(msg.position)
-            print(_ok(f"{action_topic}  →  7D 动作: {[round(v, 4) for v in action[:7]]}"))
+            p = msg.pose.position
+            q = msg.pose.orientation
+            print(_ok(
+                f"{action_topic}  →  "
+                f"pos=[{p.x:.4f}, {p.y:.4f}, {p.z:.4f}]  "
+                f"quat=[{q.x:.3f}, {q.y:.3f}, {q.z:.3f}, {q.w:.3f}]"
+            ))
             ok = True
         else:
             print(_warn(f"{action_topic}  →  {timeout_s:.0f}s 内未收到帧（UMI 设备未连接或未发布？）"))
 
     node.destroy_node()
+    umi_context.try_shutdown()
     return ok  # UMI 不连接时不算强制失败
 
 
@@ -387,6 +411,12 @@ def main():
                         help="跳过相机检测")
     parser.add_argument("--ros_timeout",  default=8.0, type=float,
                         help="等待 ROS 话题的超时秒数（默认 8s）")
+    parser.add_argument("--umi_domain_id", default=9, type=int,
+                        help="UMI ROS 消息的 DOMAIN_ID（默认 9）")
+    parser.add_argument("--cam_front_serial", default=constants.REALSENSE_FRONT_SERIAL,
+                        help="正面 RealSense 序列号（默认读取 constants.py）")
+    parser.add_argument("--cam_wrist_serial", default=constants.REALSENSE_WRIST_SERIAL,
+                        help="腕部 RealSense 序列号（默认读取 constants.py；为空时自动选第二台）")
     args = parser.parse_args()
 
     print(f"\n{'='*60}")
@@ -422,23 +452,23 @@ def main():
         print(_warn("已跳过（--skip_gripper）"))
         results["gripper"] = None
 
-    # 3 & 4. 相机（ROS 节点只初始化一次）
+    # 3 & 4. 相机（pyrealsense2 SDK 直驱）
     if not args.skip_cameras:
         results["cameras"] = check_cameras(
-            constants.CAM_FRONT_TOPIC,
-            constants.CAM_WRIST_TOPIC,
-            timeout_s=args.ros_timeout,
+            serial_front=args.cam_front_serial,
+            serial_wrist=args.cam_wrist_serial,
         )
     else:
-        print(_title("[3] RealSense 相机（ROS 话题）"))
+        print(_title("[3] RealSense 相机（pyrealsense2 SDK）"))
         print(_warn("已跳过（--skip_cameras）"))
         results["cameras"] = None
 
     # 5. UMI
     if not args.skip_umi:
         results["umi"] = check_umi(
-            constants.UMI_HUMAN_ACTION_TOPIC,
+            constants.UMI_VIO_POSE_TOPIC,
             timeout_s=args.ros_timeout,
+            domain_id=args.umi_domain_id,
         )
     else:
         print(_title("[4] UMI 示教设备"))

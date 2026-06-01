@@ -43,8 +43,8 @@ class DobotUMIEnvironment(_environment.Environment):
         reset_joint_positions: Optional[List[float]] = None,
         render_height: int = 224,
         render_width: int = 224,
-        cam_front_topic: str = constants.CAM_FRONT_TOPIC,
-        cam_wrist_topic: str = constants.CAM_WRIST_TOPIC,
+        cam_front_serial: str = constants.REALSENSE_FRONT_SERIAL,
+        cam_wrist_serial: str = constants.REALSENSE_WRIST_SERIAL,
         joint_topic: str = constants.JOINT_STATE_TOPIC,
         joint_cmd_topic: str = constants.JOINT_CMD_TOPIC,
         gripper_ctrl_topic: str = constants.GRIPPER_CTRL_TOPIC,
@@ -52,15 +52,10 @@ class DobotUMIEnvironment(_environment.Environment):
         obs_ready_timeout_s: float | None = 10.0,
     ) -> None:
         self._env = _real_env.make_real_env(
-            init_node=True,
             reset_joint_positions=reset_joint_positions,
             image_resize_hw=(render_height, render_width),
-            cam_front_topic=cam_front_topic,
-            cam_wrist_topic=cam_wrist_topic,
-            joint_topic=joint_topic,
-            joint_cmd_topic=joint_cmd_topic,
-            gripper_ctrl_topic=gripper_ctrl_topic,
-            enable_gripper_stream=enable_gripper_stream,
+            cam_front_serial=cam_front_serial,
+            cam_wrist_serial=cam_wrist_serial,
             obs_ready_timeout_s=obs_ready_timeout_s,
         )
         self._render_height = render_height

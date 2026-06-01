@@ -3,7 +3,7 @@ experiment:
     # ── 动作空间 ─────────────────────────────────────────────────────────────
     # 7D：6 个关节角（弧度）+ 1 个夹爪距离（米）
     action_dim: 7
-    chunk_len: 10
+    chunk_len: 50
     z_dim: 2048
     # 本体感知维度（与 action_dim 相同：[joint1..6, gripper_m]）
     proprio_dim: 7
@@ -85,16 +85,18 @@ runtime:
   env_driver:
     # ── Machine A（Pi0 策略服务器）WebSocket 地址 ────────────────────────────
     # 修改为实际策略服务器 IP
-    machine_a_ws_url: ws://192.168.3.5:8099
+    machine_a_ws_url: ws://127.0.0.1:8000
+    # machine_a_ws_url: ws://192.168.3.5:8099
     actor_service_url: http://127.0.0.1:9101
     replay_service_url: http://127.0.0.1:9102
 
     task_mode: critical_phase
     episode_start_control_mode: policy
 
-    # 机械臂复位位姿（7D：6 关节弧度 + 夹爪米，按实际调整）
-    full_task_reset_action:     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.08]
-    critical_phase_reset_action:[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.08]
+    # reset target pose: [x_m, y_m, z_m, rx_rad, ry_rad, rz_rad, gripper_m]
+    # Cartesian pose in base frame (position in meters, orientation in rad XYZ Euler)
+    full_task_reset_action:      [0.5793687, -0.1360939, 0.2334053, 3.14, 0.0, -1.57, 0.08]
+    critical_phase_reset_action: [0.5793687, -0.1360939, 0.2334053, 3.14, 0.0, -1.57, 0.08]
 
     actor_deterministic: false
     chunk_exec_horizon: 10
@@ -108,6 +110,29 @@ runtime:
     # UMI 人为介入使能
     enable_human_override: true
     safe_fallback_to_ref: true
+
+    # ── UMI 坐标系对齐矩阵 R_align ──────────────────────────────────────────
+    # 将 UMI 手柄体坐标系的增量旋转到机械臂末端体坐标系。
+    # 行优先展开的 3×3 旋转矩阵（共 9 个数字）。
+    # 不配置（注释掉）= 单位矩阵（不做对齐）。
+    #
+    # 标定方法：切换到 teleop，沿 UMI 各轴单独移动，观察机械臂末端响应方向：
+    #   - 若 UMI 向前（+Z）→ 机械臂 +Z：Z 轴正确
+    #   - 若 UMI 向右（+X）→ 机械臂 +Y：UMI X = robot Y，说明需要 R_align
+    #
+    # 常用候选（绕 Z 轴旋转 90°）：
+    #   +90° CCW:  [ 0, -1, 0,  1, 0, 0,  0, 0, 1 ]  → UMI X→robotY, UMI Y→robot-X
+    #   -90° CW:   [ 0,  1, 0, -1, 0, 0,  0, 0, 1 ]  → UMI X→robot-Y, UMI Y→robotX
+    #   X/Y swap+negX: [-1, 0, 0,  0, -1, 0,  0, 0, 1 ] → X/Y 互换且双负
+    #
+    # 目前先以 +90° CCW 为初始猜测尝试（Z 轴正确，X/Y 疑似互换）：
+    # umi_to_ee_R_align: [0, -1, 0,  1, 0, 0,  0, 0, 1]
+    # X/Y 轴方向正确但符号相反 → 绕 Z 旋转 180°（X/Y 同时取负，Z 不变）：
+    umi_to_ee_R_align: [-1, 0, 0,  0, -1, 0,  0, 0, 1]
+    # 旋转轴 X/Y 互换（UMI Rx→机械臂Ry，UMI Ry→机械臂Rx）
+    # 互换且 X 取负 → 绕 Z 轴 +90° CCW：[[0,-1,0],[1,0,0],[0,0,1]]
+    # 互换且 Y 取负 → 绕 Z 轴 -90° CW： [[0,1,0],[-1,0,0],[0,0,1]]
+    # umi_to_ee_R_align_rot 未配置 → 默认与 umi_to_ee_R_align 相同 (180° around Z: X/Y both flipped)
 
     machine_a_connect_timeout_sec: 5.0
     machine_a_recv_timeout_sec: 5.0

@@ -117,6 +117,10 @@ class EnvDriverConfig:
     machine_a_retry_interval_sec: float = 0.5
     actor_request_timeout_sec: float = 1.0
     replay_request_timeout_sec: float = 30.0
+    # UMI→机械臂末端坐标系对齐矩阵（行优先展开的 3×3，共 9 个 float）。None = 不对齐。
+    umi_to_ee_R_align: list[float] | None = None
+    # 单独用于旋转分量的对齐矩阵。None = 与 umi_to_ee_R_align 相同。
+    umi_to_ee_R_align_rot: list[float] | None = None
 
 
 @dataclasses.dataclass(frozen=True)

@@ -3,13 +3,13 @@
 硬件接入方式：
   - Dobot 机械臂：SDK 直驱（TCP/IP，DobotApiDashboard + DobotApiFeedBack）
   - 知行夹爪：SDK 直驱（RS-485 串口，MotorController）
-  - RealSense 相机：ROS 话题（/cam_front, /cam_wrist）
+  - RealSense 相机：pyrealsense2 SDK 直驱（不依赖 ROS）
   - UMI 示教设备：ROS 话题（/umi/human_action）
 
 依赖：
-  - rclpy（ROS 2）— 仅用于相机和 UMI 设备
-  - sensor_msgs/Image, sensor_msgs/JointState
-  - cv_bridge
+  - pyrealsense2 — 相机直驱
+  - rclpy（ROS 2）— 仅 UMI 设备
+  - sensor_msgs/JointState, geometry_msgs/PoseStamped
   - third_party/dobot_umi_sdk/dobot_sdk/dobot_api.py
   - third_party/dobot_umi_sdk/adaptive_sdk/changingtek_p_rtu_Servo.py
 """
@@ -35,7 +35,7 @@ for _p in (str(_SDK_ROOT), str(_SDK_ROOT / "dobot_sdk"), str(_SDK_ROOT / "adapti
         sys.path.insert(0, _p)
 
 try:
-    from dobot_sdk.dobot_api import DobotApiDashboard, DobotApiFeedBack
+    from dobot_api import DobotApiDashboard, DobotApiFeedBack
     _HAS_DOBOT_SDK = True
 except ImportError:
     _HAS_DOBOT_SDK = False
@@ -43,23 +43,37 @@ except ImportError:
     DobotApiFeedBack = None   # type: ignore
 
 try:
-    from adaptive_sdk.changingtek_p_rtu_Servo import MotorController
+    from changingtek_p_rtu_Servo import MotorController
     _HAS_MOTOR_SDK = True
 except ImportError:
     _HAS_MOTOR_SDK = False
     MotorController = None  # type: ignore
 
 try:
+    import pyrealsense2 as rs
+    _HAS_REALSENSE = True
+except ImportError:
+    _HAS_REALSENSE = False
+    rs = None  # type: ignore
+
+# ROS — 仅 UMI 示教设备使用
+try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image as ROSImage
     from sensor_msgs.msg import JointState
-    from cv_bridge import CvBridge
+    from geometry_msgs.msg import PoseStamped as ROSPoseStamped
     _ROS_AVAILABLE = True
 except ImportError:
     _ROS_AVAILABLE = False
     Node = object  # type: ignore[assignment,misc]
+
+try:
+    from scipy.spatial.transform import Rotation as _Rotation
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+    _Rotation = None  # type: ignore
 
 from examples.dobot_umi import constants
 
@@ -97,7 +111,8 @@ def _ros_stamp_to_sec(stamp) -> float:
 
 
 def _ros_image_to_rgb_u8(msg, resize_hw=None) -> np.ndarray:
-    """将 ROS Image 消息转为 HWC uint8 RGB numpy 数组。"""
+    """将 ROS Image 消息转为 HWC uint8 RGB numpy 数组。（保留，供需要 ROS 桥接的场景使用）"""
+    from cv_bridge import CvBridge
     bridge = CvBridge()
     encoding = msg.encoding if msg.encoding else "bgr8"
     if "rgb" in encoding.lower():
@@ -342,6 +357,61 @@ class DobotSDKArm:
             return self._wait_idle(timeout)
         return True
 
+    def get_end_effector_pose_matrix(self) -> np.ndarray:
+        """通过 SDK GetPose() 获取末端执行器在基座坐标系下的 4×4 齐次变换矩阵。
+
+        返回格式：位置单位为米（m）。
+        旋转使用 Dobot 惯例的 XYZ Euler 角（rx/ry/rz，单位 deg）。
+        若获取失败或 scipy 不可用则返回单位矩阵。
+        """
+        if not self._connected or _Rotation is None:
+            return np.eye(4, dtype=np.float64)
+        try:
+            resp = self._dashboard.GetPose()
+            _, vals = _parse_dobot_response(resp)
+            if vals and len(vals) >= 6:
+                x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg = vals[:6]
+                R = _Rotation.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True).as_matrix()
+                T = np.eye(4, dtype=np.float64)
+                T[:3, :3] = R
+                T[:3, 3] = [x_mm * 1e-3, y_mm * 1e-3, z_mm * 1e-3]
+                return T
+        except Exception as e:
+            print(f"[DobotSDKArm] GetPose 失败: {e}")
+        return np.eye(4, dtype=np.float64)
+
+    def inverse_kinematics_from_matrix(
+        self, T_target: np.ndarray, q_seed: np.ndarray | None = None
+    ) -> np.ndarray | None:
+        """逆运动学：给定 4×4 目标位姿矩阵，返回 6D 关节角（弧度）。
+
+        优先使用 Dobot SDK 的 GetInverseKin 命令（CR 系列固件通常支持）。
+        若不支持或失败，回退到种子关节角（保持当前位置）。
+
+        Args:
+            T_target:  4×4 目标齐次变换矩阵，位置单位为米（m）。
+            q_seed:    IK 初始猜测（6D 弧度），用于选解和失败回退。
+        Returns:
+            6D 关节角（弧度）；失败时返回 q_seed（若有）或当前关节角。
+        """
+        if not self._connected or _Rotation is None:
+            return q_seed.astype(np.float32, copy=True) if q_seed is not None else None
+        try:
+            x_mm   = float(T_target[0, 3] * 1000.0)
+            y_mm   = float(T_target[1, 3] * 1000.0)
+            z_mm   = float(T_target[2, 3] * 1000.0)
+            euler  = _Rotation.from_matrix(T_target[:3, :3]).as_euler("xyz", degrees=True)
+            rx_deg, ry_deg, rz_deg = float(euler[0]), float(euler[1]), float(euler[2])
+            resp = self._dashboard.GetInverseKin(x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg)
+            _, vals = _parse_dobot_response(resp)
+            if vals and len(vals) >= 6:
+                return np.deg2rad(np.array(vals[:6], dtype=np.float32))
+        except Exception as e:
+            print(f"[DobotSDKArm] GetInverseKin 不可用或失败（将保持位置）: {e}")
+        if q_seed is not None:
+            return q_seed.astype(np.float32, copy=True)
+        return self.get_joint_angles_rad()
+
     def stop(self) -> bool:
         if not self._connected:
             return False
@@ -508,135 +578,354 @@ class ZhixingSDKGripper:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 图像缓冲节点（两路 RealSense，ROS 话题）
+# 图像采集器（两路 RealSense，pyrealsense2 SDK 直驱）
 # ─────────────────────────────────────────────────────────────────────────────
 
-class DobotImageRecorder(Node):
-    """订阅两路 RealSense 相机话题，缓存最新帧。"""
+class RealSenseImageRecorder:
+    """使用 pyrealsense2 SDK 直接采集两路 RealSense 彩色图像。
+
+    不依赖 ROS，无需提前启动相机 launch 文件。
+
+    Args:
+        serial_front:  正面相机序列号；为空时使用枚举到的第 1 台设备。
+        serial_wrist:  腕部相机序列号；为空时使用枚举到的第 2 台设备。
+        width / height / fps:  分辨率和帧率（D405 支持 640×480@30）。
+        align_depth:   是否对齐深度到彩色（默认 False，仅用彩色流）。
+
+    使用示例::
+
+        rec = RealSenseImageRecorder(serial_front="...", serial_wrist="...")
+        rec.start()
+        images = rec.get_images()   # {"cam_front": ndarray, "cam_wrist": ndarray}
+        rec.stop()
+    """
 
     def __init__(
         self,
         *,
-        cam_front_topic: str = constants.CAM_FRONT_TOPIC,
-        cam_wrist_topic: str = constants.CAM_WRIST_TOPIC,
-        queue_size: int = 200,
+        serial_front: str = constants.REALSENSE_FRONT_SERIAL,
+        serial_wrist: str = constants.REALSENSE_WRIST_SERIAL,
+        width: int = constants.REALSENSE_WIDTH,
+        height: int = constants.REALSENSE_HEIGHT,
+        fps: int = constants.REALSENSE_FPS,
     ):
-        super().__init__("dobot_image_recorder")
+        if not _HAS_REALSENSE:
+            raise ImportError(
+                "pyrealsense2 不可用。请安装：pip install pyrealsense2"
+            )
+        self._serial_front = serial_front
+        self._serial_wrist = serial_wrist
+        self._width = width
+        self._height = height
+        self._fps = fps
+
+        self._pipeline_front: Any = None
+        self._pipeline_wrist: Any = None
+        self._started = False
         self._lock = threading.Lock()
-        self._bridge = CvBridge()
 
-        self._front_msg = None
-        self._wrist_msg = None
-        self._front_queue: deque = deque(maxlen=queue_size)
-        self._wrist_queue: deque = deque(maxlen=queue_size)
-        self._last_wait_log_ts = 0.0
+        self._latest_front: Optional[np.ndarray] = None
+        self._latest_wrist: Optional[np.ndarray] = None
+        self._latest_ts_front: float = 0.0
+        self._latest_ts_wrist: float = 0.0
 
-        qos = qos_profile_sensor_data
-        self.create_subscription(ROSImage, cam_front_topic, self._on_front, qos)
-        self.create_subscription(ROSImage, cam_wrist_topic, self._on_wrist, qos)
+        self._grab_thread: Optional[threading.Thread] = None
+        self._grab_running = False
 
-    def _on_front(self, msg) -> None:
-        with self._lock:
-            self._front_msg = msg
-            self._front_queue.append(msg)
-
-    def _on_wrist(self, msg) -> None:
-        with self._lock:
-            self._wrist_msg = msg
-            self._wrist_queue.append(msg)
-
-    def snapshot(self):
-        with self._lock:
-            return self._front_msg, self._wrist_msg
+    # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _stamp_sec(msg) -> float:
-        return _ros_stamp_to_sec(getattr(msg.header, "stamp", None))
+    def _list_connected_serials() -> list[str]:
+        ctx = rs.context()
+        return [d.get_info(rs.camera_info.serial_number) for d in ctx.query_devices()]
 
-    def aligned_snapshot(self):
-        with self._lock:
-            if not (self._front_queue and self._wrist_queue):
-                return None
-            frame_time = min(
-                self._stamp_sec(self._front_queue[-1]),
-                self._stamp_sec(self._wrist_queue[-1]),
-            )
-            for q in (self._front_queue, self._wrist_queue):
-                while len(q) > 1 and self._stamp_sec(q[0]) < frame_time:
-                    q.popleft()
-                if self._stamp_sec(q[0]) < frame_time:
-                    return None
-            return self._front_queue[0], self._wrist_queue[0]
+    def _make_pipeline(self, serial: str) -> Any:
+        pipeline = rs.pipeline()
+        cfg = rs.config()
+        if serial:
+            cfg.enable_device(serial)
+        cfg.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
+        pipeline.start(cfg)
+        return pipeline
+
+    @staticmethod
+    def _frame_to_rgb_u8(frame, resize_hw=None) -> np.ndarray:
+        img = np.asanyarray(frame.get_data())  # HWC uint8 RGB
+        if resize_hw is not None:
+            h, w = resize_hw
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+        return img
+
+    # ── 生命周期 ──────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """启动两路相机流并开始后台采集线程。"""
+        if self._started:
+            return
+        serials = self._list_connected_serials()
+        print(f"[RealSenseImageRecorder] 检测到 {len(serials)} 台设备: {serials}")
+
+        # 解析正面相机序列号
+        front_sn = self._serial_front
+        if not front_sn:
+            if serials:
+                front_sn = serials[0]
+                print(f"[RealSenseImageRecorder] 未指定 front 序列号，自动选择: {front_sn}")
+            else:
+                raise RuntimeError("未检测到任何 RealSense 设备")
+
+        # 解析腕部相机序列号
+        wrist_sn = self._serial_wrist
+        if not wrist_sn:
+            remaining = [s for s in serials if s != front_sn]
+            if remaining:
+                wrist_sn = remaining[0]
+                print(f"[RealSenseImageRecorder] 未指定 wrist 序列号，自动选择: {wrist_sn}")
+            else:
+                print("[RealSenseImageRecorder] ⚠ 仅检测到 1 台设备，front 和 wrist 将使用同一相机")
+                wrist_sn = front_sn
+
+        self._pipeline_front = self._make_pipeline(front_sn)
+        self._pipeline_wrist = self._make_pipeline(wrist_sn) if wrist_sn != front_sn else None
+        self._started = True
+
+        # 后台采集线程
+        self._grab_running = True
+        self._grab_thread = threading.Thread(target=self._grab_loop, daemon=True)
+        self._grab_thread.start()
+        print("[RealSenseImageRecorder] 已启动（后台采集线程运行中）")
+
+    def stop(self) -> None:
+        """停止采集线程并关闭相机流。"""
+        self._grab_running = False
+        if self._grab_thread:
+            self._grab_thread.join(timeout=2.0)
+            self._grab_thread = None
+        if self._pipeline_front:
+            try:
+                self._pipeline_front.stop()
+            except Exception:
+                pass
+            self._pipeline_front = None
+        if self._pipeline_wrist:
+            try:
+                self._pipeline_wrist.stop()
+            except Exception:
+                pass
+            self._pipeline_wrist = None
+        self._started = False
+        print("[RealSenseImageRecorder] 已停止")
+
+    def _grab_loop(self) -> None:
+        """后台线程：持续从相机流抓取最新帧。"""
+        while self._grab_running:
+            try:
+                if self._pipeline_front:
+                    frames = self._pipeline_front.wait_for_frames(timeout_ms=200)
+                    color = frames.get_color_frame()
+                    if color:
+                        img = self._frame_to_rgb_u8(color)
+                        with self._lock:
+                            self._latest_front = img
+                            self._latest_ts_front = frames.get_timestamp()
+            except Exception:
+                pass
+
+            try:
+                if self._pipeline_wrist:
+                    frames = self._pipeline_wrist.wait_for_frames(timeout_ms=200)
+                    color = frames.get_color_frame()
+                    if color:
+                        img = self._frame_to_rgb_u8(color)
+                        with self._lock:
+                            self._latest_wrist = img
+                            self._latest_ts_wrist = frames.get_timestamp()
+                elif self._pipeline_front is None:
+                    pass
+                else:
+                    # 单相机模式：wrist 复用 front
+                    with self._lock:
+                        self._latest_wrist = self._latest_front
+                        self._latest_ts_wrist = self._latest_ts_front
+            except Exception:
+                pass
+
+    # ── 就绪检查 ──────────────────────────────────────────────────────────────
 
     def is_ready(self) -> bool:
-        front, wrist = self.snapshot()
-        return front is not None and wrist is not None
+        with self._lock:
+            return self._latest_front is not None and self._latest_wrist is not None
 
-    def wait_ready(self, timeout_s=None) -> None:
+    def wait_ready(self, timeout_s: float = 10.0) -> None:
+        """阻塞等待两路相机均有帧可用。"""
         start = time.time()
-        while rclpy.ok():
+        while True:
             if self.is_ready():
                 return
-            now = time.time()
-            if now - self._last_wait_log_ts >= 2.0:
-                self._last_wait_log_ts = now
-                self.get_logger().warning("等待 RealSense 图像帧 (cam_front / cam_wrist) ...")
-            if timeout_s is not None and (now - start) > timeout_s:
-                raise RuntimeError("超时：未收到 RealSense 图像")
-            time.sleep(0.02)
+            if time.time() - start > timeout_s:
+                raise RuntimeError("超时：RealSense 相机未就绪（等待首帧超时）")
+            time.sleep(0.05)
 
-    def get_images(self, resize_hw=None, *, align_timestamps: bool = True) -> dict[str, np.ndarray]:
-        if align_timestamps:
-            snap = self.aligned_snapshot()
-            if snap is None:
-                snap = self.snapshot()
-        else:
-            snap = self.snapshot()
-        front_msg, wrist_msg = snap
-        if front_msg is None or wrist_msg is None:
-            raise RuntimeError("图像帧尚未就绪，请先调用 wait_ready()")
+    # ── 图像读取 ──────────────────────────────────────────────────────────────
+
+    def get_images(
+        self,
+        resize_hw: Optional[tuple[int, int]] = None,
+        *,
+        align_timestamps: bool = True,
+    ) -> dict[str, np.ndarray]:
+        """返回最新一对彩色图像（HWC uint8 RGB）。
+
+        Args:
+            resize_hw:         目标尺寸 (H, W)；None 保持原始分辨率。
+            align_timestamps:  当前 SDK 模式下时间戳已由后台线程近实时同步，该参数保留供接口兼容。
+        """
+        with self._lock:
+            front = self._latest_front
+            wrist = self._latest_wrist
+
+        if front is None or wrist is None:
+            raise RuntimeError("图像帧尚未就绪，请先调用 wait_ready() 或 start()")
+
+        if resize_hw is not None:
+            h, w = resize_hw
+            front = cv2.resize(front, (w, h), interpolation=cv2.INTER_LINEAR)
+            wrist = cv2.resize(wrist, (w, h), interpolation=cv2.INTER_LINEAR)
+
         return {
-            constants.IMAGE_KEY_FRONT: _ros_image_to_rgb_u8(front_msg, resize_hw),
-            constants.IMAGE_KEY_WRIST: _ros_image_to_rgb_u8(wrist_msg, resize_hw),
+            constants.IMAGE_KEY_FRONT: front.copy(),
+            constants.IMAGE_KEY_WRIST: wrist.copy(),
         }
 
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+
+# 向后兼容别名（旧代码若直接用 DobotImageRecorder 仍可工作，但已不推荐）
+DobotImageRecorder = RealSenseImageRecorder
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UMI 人为介入动作录制节点（ROS 话题）
+# UMI VIO 位姿录制节点 —— 增量映射到机械臂关节角
 # ─────────────────────────────────────────────────────────────────────────────
 
-class UMIHumanActionRecorder(Node):
-    """订阅 UMI 设备发布的人类示教动作（7D：6 关节弧度 + 夹爪距离 m）。
+class UMIPoseRecorder(Node):
+    """订阅 UMI 设备的 VIO 位姿话题，通过增量映射输出机械臂目标关节角。
 
-    UMI 设备以 JointState 格式发布示教动作到 /umi/human_action，
-    本节点缓存最新一帧供 EnvDriver 在人工介入阶段使用。
+    工作原理（按 't' 对齐时）：
+
+      1. 用户手动将 UMI 手柄调整到与机械臂末端位姿大致一致的方向/位置；
+      2. 按 't' 键触发 set_alignment_reference()：
+           - 记录此刻 UMI 位姿为 T_umi_ref（VIO 世界坐标系）
+           - 记录此刻机械臂末端位姿为 T_ee_ref（通过 SDK GetPose）
+           - 记录此刻关节角为 q_ref（作为 IK 种子及失败回退）
+      3. 后续每步计算：
+           delta_T      = T_umi_ref^{-1} @ T_umi_curr   （UMI 手柄相对运动）
+           T_ee_target  = T_ee_ref @ delta_T              （相同增量映射到机械臂）
+           q_target     = IK(T_ee_target, seed=q_ref)
+
+    输出格式：
+        snapshot_latest() → (np.ndarray shape (7,), seq_id)
+        其中 7D = [j1..j6 rad, gripper_m]
     """
 
-    def __init__(self, action_topic: str = constants.UMI_HUMAN_ACTION_TOPIC):
-        super().__init__("umi_human_action_recorder")
+    def __init__(
+        self,
+        pose_topic: str,
+        arm: "DobotSDKArm",
+        gripper: "ZhixingSDKGripper",
+        max_gripper_m: float = constants.GRIPPER_OPEN_M,
+    ):
+        super().__init__("umi_pose_recorder")
+        if not _HAS_SCIPY:
+            raise ImportError("UMIPoseRecorder 需要 scipy。请 pip install scipy。")
+        self._arm = arm
+        self._gripper = gripper
+        self._max_gripper_m = max_gripper_m
         self._lock = threading.Lock()
-        self._latest_action: np.ndarray | None = None
+
+        self._latest_T: np.ndarray | None = None
         self._latest_seq: int = -1
-        self.create_subscription(JointState, action_topic, self._on_action, 50)
-        self.get_logger().info(f"UMI 人类示教动作订阅话题: {action_topic}")
 
-    def _on_action(self, msg) -> None:
-        action = np.asarray(msg.position, dtype=np.float32).reshape(-1)
-        if action.shape[0] < 7:
-            self.get_logger().warning(
-                f"UMI 动作维度不足 7（当前 {action.shape[0]}），已忽略"
-            )
-            return
+        self._T_umi_ref: np.ndarray | None = None
+        self._T_ee_ref: np.ndarray | None = None
+        self._q_ref: np.ndarray | None = None
+        self._last_output: np.ndarray | None = None
+
+        self.create_subscription(ROSPoseStamped, pose_topic, self._on_pose, 50)
+        self.get_logger().info(f"UMI VIO 位姿话题订阅: {pose_topic}")
+
+    @staticmethod
+    def _pose_msg_to_matrix(msg) -> np.ndarray:
+        p = msg.position
+        q = msg.orientation
+        R = _Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3, 3] = [p.x, p.y, p.z]
+        return T
+
+    def _on_pose(self, msg: ROSPoseStamped) -> None:
+        T = self._pose_msg_to_matrix(msg.pose)
         with self._lock:
-            self._latest_action = action[:7].copy()
+            self._latest_T = T
             self._latest_seq += 1
-
-    def snapshot_latest(self):
-        with self._lock:
-            if self._latest_action is None:
-                return None, self._latest_seq
-            return self._latest_action.copy(), self._latest_seq
 
     def is_ready(self) -> bool:
         with self._lock:
-            return self._latest_action is not None
+            return self._latest_T is not None
+
+    def set_alignment_reference(self) -> None:
+        """对齐参考帧：在用户按 't' 并手动对齐后调用。"""
+        with self._lock:
+            T_umi = self._latest_T
+        if T_umi is None:
+            self.get_logger().warning("set_alignment_reference: 尚未收到 UMI 位姿，跳过")
+            return
+        T_ee = self._arm.get_end_effector_pose_matrix()
+        q_now = self._arm.get_joint_angles_rad()
+        with self._lock:
+            self._T_umi_ref = T_umi.copy()
+            self._T_ee_ref  = T_ee.copy()
+            self._q_ref     = q_now.copy()
+        self.get_logger().info(
+            "对齐参考帧已记录 | EE 位置(m): [%.4f, %.4f, %.4f]",
+            T_ee[0, 3], T_ee[1, 3], T_ee[2, 3],
+        )
+
+    def snapshot_latest(self) -> tuple[np.ndarray | None, int]:
+        """返回 (7D [关节角×6 + 夹爪], seq_id)。"""
+        with self._lock:
+            T_umi_curr = self._latest_T
+            seq        = self._latest_seq
+            T_umi_ref  = self._T_umi_ref
+            T_ee_ref   = self._T_ee_ref
+            q_ref      = self._q_ref
+
+        gripper_m = float(np.clip(self._gripper.get_position_m(), 0.0, self._max_gripper_m))
+
+        def _hold() -> np.ndarray:
+            q = self._arm.get_joint_angles_rad()
+            return np.concatenate([q, [gripper_m]], dtype=np.float32)
+
+        if T_umi_curr is None or T_umi_ref is None or T_ee_ref is None or q_ref is None:
+            return _hold(), seq
+
+        delta_T     = np.linalg.inv(T_umi_ref) @ T_umi_curr
+        T_ee_target = T_ee_ref @ delta_T
+        q_target    = self._arm.inverse_kinematics_from_matrix(T_ee_target, q_seed=q_ref)
+
+        if q_target is None:
+            return (self._last_output.copy() if self._last_output is not None else _hold()), seq
+
+        action = np.concatenate([q_target, [gripper_m]], dtype=np.float32)
+        with self._lock:
+            self._last_output = action.copy()
+        return action, seq
+
+
+# 向后兼容别名
+UMIHumanActionRecorder = UMIPoseRecorder

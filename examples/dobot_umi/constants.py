@@ -17,7 +17,7 @@ DOBOT_USE_FEEDBACK     = True             # 是否启动反馈线程（获取关
 # ─────────────────────────────────────────────────────────────
 # 知行夹爪 SDK 直驱参数（RS-485 串口）
 # ─────────────────────────────────────────────────────────────
-GRIPPER_SERIAL_PORT    = "/dev/ttyUSB0"   # USB-Serial 设备节点
+GRIPPER_SERIAL_PORT    = "/dev/ttyUSB1"   # USB-Serial 设备节点（CH340；ttyUSB0 被 micro_ros_agent 占用）
 GRIPPER_SLAVE_ID       = 1
 GRIPPER_BAUDRATE       = 115200
 GRIPPER_SPEED_PCT      = 5                # 运动速度百分比（1–100）
@@ -44,13 +44,26 @@ GRIPPER_NORMALIZE_FN   = lambda x: (x - GRIPPER_CLOSE_M) / (GRIPPER_OPEN_M - GRI
 GRIPPER_UNNORMALIZE_FN = lambda x: x * (GRIPPER_OPEN_M - GRIPPER_CLOSE_M) + GRIPPER_CLOSE_M
 
 # ─────────────────────────────────────────────────────────────
-# ROS 话题名称（仅相机和 UMI 设备走 ROS；机械臂/夹爪走 SDK 直驱）
+# RealSense 相机（SDK 直驱，pyrealsense2）
+# 用 rs-enumerate-devices 或 check_hardware.py 获取序列号
 # ─────────────────────────────────────────────────────────────
-# RealSense 相机话题（两个相机）
+REALSENSE_FRONT_SERIAL  = "341522300463"   # 正面相机序列号（请按实际填写）
+REALSENSE_WRIST_SERIAL  = "427622270458"   # 腕部相机序列号（请按实际填写；为空时自动选第二台）
+REALSENSE_WIDTH         = 640
+REALSENSE_HEIGHT        = 480
+REALSENSE_FPS           = 30
+
+# ─────────────────────────────────────────────────────────────
+# ROS 话题名称（仅 UMI 设备走 ROS；相机已改为 SDK 直驱）
+# ─────────────────────────────────────────────────────────────
+# RealSense 相机话题（保留，供需要 ROS 桥接的场景使用）
 CAM_FRONT_TOPIC         = "/cam_front/color/image_raw"   # 正面/全局视角
 CAM_WRIST_TOPIC         = "/cam_wrist/color/image_raw"   # 腕部视角
 
-# UMI 人为介入：发布 7D 人类示教动作的话题（6 关节 + 夹爪）
+# UMI 人为介入：VIO 末端位姿话题（PoseStamped，UMI 世界坐标系）
+UMI_VIO_POSE_TOPIC      = "/umi1/vio/pose"
+
+# UMI 人为介入：（旧版）直接发布 7D 关节动作的话题（向后兼容，不再推荐）
 UMI_HUMAN_ACTION_TOPIC  = "/umi/human_action"
 
 # UMI 触发：切换策略/手动接管的 ROS 服务名
