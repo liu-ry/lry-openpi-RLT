@@ -406,6 +406,21 @@
     }
 
     async function pickDirectory() {
+      try {
+        const picked = await api('/api/pick-directory');
+        if (picked.cancelled) {
+          setPathStatus('已取消选择目录');
+          return;
+        }
+        if (picked.path) {
+          state.pickedHandle = null;
+          $('dataRoot').value = picked.path;
+          setPathStatus('已选择目录，点击“打开”后会打开该路径');
+          return;
+        }
+      } catch (e) {
+        setPathStatus(`本机目录选择不可用，尝试浏览器目录导入: ${e}`);
+      }
       if (!window.showDirectoryPicker) {
         setPathStatus('当前浏览器不支持目录选择器，请手动粘贴路径', true);
         return;
@@ -413,8 +428,8 @@
       try {
         const handle = await window.showDirectoryPicker();
         state.pickedHandle = handle;
-        $('dataRoot').value = handle.name;
-        setPathStatus('已选择目录，点击“打开”后会把 pkl 导入到本机临时目录');
+        if (!$('dataRoot').value.trim()) $('dataRoot').value = handle.name;
+        setPathStatus(`浏览器无法提供完整路径；点击“打开”后会导入所选目录 ${handle.name}`);
       } catch (e) {
         if (e && e.name !== 'AbortError') setPathStatus(String(e), true);
       }

@@ -8,6 +8,7 @@ import json
 import os
 import pickle
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -497,6 +498,63 @@ def set_data_root_api():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, "root": str(active)})
+
+
+@app.get("/api/pick-directory")
+def pick_directory_api():
+    initial_dir = str(get_data_root())
+    picker_commands = []
+    if shutil.which("zenity"):
+        picker_commands.append(
+            [
+                "zenity",
+                "--file-selection",
+                "--directory",
+                "--title=Select replay directory",
+                f"--filename={initial_dir}/",
+            ]
+        )
+    if shutil.which("kdialog"):
+        picker_commands.append(["kdialog", "--getexistingdirectory", initial_dir])
+
+    for command in picker_commands:
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
+        except Exception:
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return jsonify({"ok": True, "path": str(Path(result.stdout.strip()).expanduser().resolve())})
+        if result.returncode != 0:
+            return jsonify({"ok": False, "cancelled": True, "path": ""})
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Native directory picker unavailable: {exc}"}), 501
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(
+            title="Select replay directory",
+            initialdir=initial_dir,
+            mustexist=True,
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Native directory picker failed: {exc}"}), 500
+    finally:
+        try:
+            if root is not None:
+                root.destroy()
+        except Exception:
+            pass
+
+    if not selected:
+        return jsonify({"ok": False, "cancelled": True, "path": ""})
+    return jsonify({"ok": True, "path": str(Path(selected).expanduser().resolve())})
 
 
 @app.post("/api/import-picked-root")
