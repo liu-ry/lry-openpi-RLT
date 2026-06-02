@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Replay PKL Viewer</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101317; --panel:#191d22; --panel2:#20262d; --line:#323a44; --text:#e9edf2; --muted:#9aa7b4; --accent:#4fb477; --accent2:#69a7e8; --warn:#e2a04b; --danger:#d86f6f; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+    header { height:58px; display:flex; align-items:center; justify-content:space-between; padding:0 18px; border-bottom:1px solid var(--line); background:#14181d; position:sticky; top:0; z-index:5; }
+    h1 { font-size:16px; margin:0; font-weight:700; letter-spacing:0; }
+    button, select, input { background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:6px; height:34px; padding:0 10px; }
+    button { cursor:pointer; }
+    button.active { background:var(--accent); color:#07120b; border-color:var(--accent); font-weight:700; }
+    main { display:grid; grid-template-columns: 320px minmax(0, 1fr); min-height:calc(100vh - 58px); }
+    aside { border-right:1px solid var(--line); padding:14px; overflow:auto; background:#12161a; }
+    section { min-width:0; padding:14px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .tabs { display:flex; gap:8px; }
+    .stat { color:var(--muted); font-size:12px; margin-top:8px; }
+    .error { color:var(--danger); }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; min-width:0; }
+    .grid { display:grid; grid-template-columns: minmax(360px, 1.15fr) minmax(340px, .85fr); gap:12px; align-items:start; }
+    .media { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:10px; margin-bottom:12px; }
+    .cam { display:flex; flex-direction:column; }
+    .cam img { width:min(100%, 448px); aspect-ratio:1 / 1; object-fit:contain; align-self:center; background:#080a0c; border:1px solid var(--line); border-radius:6px; image-rendering:auto; }
+    .cam label, .label { display:block; color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .timeline { position:sticky; top:58px; z-index:4; display:grid; grid-template-columns:auto auto minmax(180px,1fr) auto auto auto; gap:10px; align-items:center; margin-bottom:12px; }
+    .path-tools { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:8px; }
+    .path-tools input { width:100%; }
+    input[type=range] { width:100%; padding:0; accent-color:var(--accent); }
+    canvas { width:100%; height:220px; background:#0b0e11; border:1px solid var(--line); border-radius:6px; display:block; }
+    .curve-list { max-height:172px; overflow:auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:4px 10px; margin-top:8px; }
+    .curve-list label { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--muted); }
+    pre { margin:0; white-space:pre-wrap; overflow:auto; max-height:calc(100vh - 248px); color:#dfe6ee; }
+    details { border-left:2px solid #39434f; padding-left:8px; margin:4px 0; }
+    summary { cursor:pointer; color:#dce6ef; }
+    .kv { color:var(--muted); }
+    .search { width:100%; margin:10px 0; }
+    .episodes { display:grid; gap:6px; margin-top:10px; }
+    .episode { text-align:left; height:auto; padding:8px; }
+    .episode small { color:var(--muted); display:block; margin-top:2px; }
+    .hidden { display:none !important; }
+    @media (max-width: 920px) { main { grid-template-columns:1fr; } aside { border-right:0; border-bottom:1px solid var(--line); } .grid { grid-template-columns:1fr; } .timeline { grid-template-columns:1fr 1fr; position:static; } .path-tools { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Replay PKL Viewer</h1>
+    <div class="tabs">
+      <button id="tabJournal" class="active">replay_journal.pkl</button>
+      <button id="tabEpisodes">episodes/*.pkl</button>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <div class="panel">
+        <div class="label">Replay 目录</div>
+        <div class="path-tools">
+          <input id="dataRoot" placeholder="/path/to/replay" />
+          <button id="pickDir">选择目录</button>
+          <button id="applyDir">打开</button>
+        </div>
+        <div id="pathStatus" class="stat"></div>
+      </div>
+      <div class="panel" style="margin-top:12px">
+        <div class="label">数据源</div>
+        <div id="summary" class="stat">loading</div>
+        <input id="filter" class="search" placeholder="过滤 episode 文件名" />
+        <div id="episodeList" class="episodes hidden"></div>
+      </div>
+      <div class="panel" style="margin-top:12px">
+        <div class="label">整体结构</div>
+        <div id="structure"></div>
+      </div>
+    </aside>
+    <section>
+      <div class="timeline panel">
+        <button id="play">▶</button>
+        <button id="prev">-1</button>
+        <input id="slider" type="range" min="0" max="0" value="0" />
+        <button id="next">+1</button>
+        <select id="speed"><option value="33">30 fps</option><option value="42">24 fps</option><option value="62">16 fps</option><option value="83">12 fps</option><option value="125">8 fps</option><option value="200" selected>5 fps</option><option value="500">2 fps</option><option value="1000">1 fps</option></select>
+        <span id="frameText" class="stat">0 / 0</span>
+      </div>
+      <div class="grid">
+        <div>
+          <div id="media" class="media"></div>
+          <div class="panel">
+            <div class="row" style="justify-content:space-between">
+              <div id="curveTitle" class="label">曲线</div>
+              <button id="clearCurves">清空</button>
+            </div>
+            <canvas id="chart" width="1000" height="360"></canvas>
+            <div id="curves" class="curve-list"></div>
+          </div>
+          <div class="panel" style="margin-top:12px">
+            <div class="label">Journal 字段说明</div>
+            <pre id="fieldDescriptions">切到 replay_journal.pkl 后显示</pre>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="label">当前帧结构化数据</div>
+          <pre id="frameData">loading</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const state = { mode:'journal', selectedEpisode:null, selectedJournalEpisode:null, overview:null, frame:0, count:0, timer:false, curves:new Set(), loadingFrame:false, lastTick:0, pendingFrame:null, prefetched:new Set(), activeCurves:[], pickedHandle:null };
+    const $ = id => document.getElementById(id);
+
+    async function api(path, options) {
+      const r = await fetch(path, options);
+      if (!r.ok) {
+        let msg = `${r.status} ${r.statusText}`;
+        try {
+          const body = await r.json();
+          msg = body.error || msg;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+      return r.json();
+    }
+    function fmtBytes(mb) { return `${mb.toFixed ? mb.toFixed(2) : mb} MB`; }
+    function setBusy(text) { $('frameData').textContent = text; }
+    function setPathStatus(text, isError=false) { $('pathStatus').textContent = text; $('pathStatus').className = `stat${isError ? ' error' : ''}`; }
+
+    function renderTree(x) {
+      if (x == null) return '<span class="kv">null</span>';
+      if (typeof x !== 'object') return `<span class="kv">${escapeHtml(String(x))}</span>`;
+      const kind = x.kind || typeof x;
+      const meta = [kind, x.len != null ? `len=${x.len}` : '', x.shape ? `shape=${x.shape.join('x')}` : '', x.dtype ? `dtype=${x.dtype}` : ''].filter(Boolean).join(' ');
+      const kids = x.items || x.fields || x.sample;
+      if (!kids) return `<span class="kv">${escapeHtml(JSON.stringify(x))}</span>`;
+      if (Array.isArray(kids)) return `<details open><summary>${escapeHtml(meta)}</summary>${kids.map((v,i)=>`<div><b>${i}</b>: ${renderTree(v)}</div>`).join('')}</details>`;
+      return `<details open><summary>${escapeHtml(meta)}</summary>${Object.entries(kids).map(([k,v])=>`<div><b>${escapeHtml(k)}</b>: ${renderTree(v)}</div>`).join('')}</details>`;
+    }
+
+    function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    function setupCurves(curves) {
+      state.activeCurves = curves;
+      const names = new Set(curves.map(c => c.name));
+      const kept = [...state.curves].filter(name => names.has(name));
+      const defaults = curves.filter(c => c.default).slice(0, 10).map(c => c.name);
+      state.curves = kept.length ? new Set(kept) : new Set((defaults.length ? defaults : curves.slice(0, Math.min(8, curves.length)).map(c => c.name)));
+      $('curves').innerHTML = curves.map(c => `<label title="${escapeHtml(c.name)}"><input type="checkbox" data-curve="${escapeHtml(c.name)}" ${state.curves.has(c.name)?'checked':''}> ${escapeHtml(c.name)}</label>`).join('');
+      $('curves').querySelectorAll('input').forEach(cb => cb.onchange = () => { cb.checked ? state.curves.add(cb.dataset.curve) : state.curves.delete(cb.dataset.curve); drawChart(); });
+      drawChart();
+    }
+
+    function drawChart() {
+      const canvas = $('chart'), ctx = canvas.getContext('2d');
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = '#0b0e11'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      const curves = (state.activeCurves || []).filter(c => state.curves.has(c.name));
+      ctx.strokeStyle = '#2e3742'; ctx.lineWidth = 1;
+      for (let i=0;i<5;i++) { const y=30+i*(canvas.height-60)/4; ctx.beginPath(); ctx.moveTo(40,y); ctx.lineTo(canvas.width-16,y); ctx.stroke(); }
+      if (!curves.length) { ctx.fillStyle='#9aa7b4'; ctx.fillText('选择曲线字段', 44, 42); return; }
+      let vals = curves.flatMap(c => c.points.map(p => p.y)).filter(Number.isFinite);
+      let min = Math.min(...vals), max = Math.max(...vals); if (min === max) { min -= 1; max += 1; }
+      const maxX = Math.max(1, state.count - 1);
+      const colors = ['#4fb477','#69a7e8','#e2a04b','#d86f6f','#b88af0','#73c6c8','#e07db0','#ced36c'];
+      curves.forEach((c, ci) => {
+        ctx.strokeStyle = colors[ci % colors.length]; ctx.lineWidth = 2; ctx.beginPath();
+        let hasOpenPath = false;
+        c.points.forEach((p) => {
+          if (p.break) {
+            if (hasOpenPath) ctx.stroke();
+            ctx.beginPath();
+            hasOpenPath = false;
+            return;
+          }
+          const x = 40 + p.x / maxX * (canvas.width - 56);
+          const y = 18 + (1 - (p.y - min) / (max - min)) * (canvas.height - 48);
+          hasOpenPath ? ctx.lineTo(x,y) : ctx.moveTo(x,y);
+          hasOpenPath = true;
+        });
+        if (hasOpenPath) ctx.stroke();
+        ctx.fillStyle = colors[ci % colors.length]; ctx.fillText(c.name, 46, 22 + ci * 17);
+      });
+      const fx = 40 + state.frame / maxX * (canvas.width - 56);
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(fx, 12); ctx.lineTo(fx, canvas.height - 14); ctx.stroke();
+      ctx.fillStyle = '#9aa7b4'; ctx.fillText(`${min.toFixed(3)} .. ${max.toFixed(3)}`, canvas.width - 150, 22);
+    }
+
+    async function loadCurrentRoot() {
+      try {
+        const current = await api('/api/current-root');
+        $('dataRoot').value = current.root || '';
+        setPathStatus(current.root || '');
+      } catch (e) {
+        setPathStatus(String(e), true);
+      }
+    }
+
+    async function loadSummary() {
+      const s = await api('/api/summary');
+      $('dataRoot').value = s.root;
+      $('summary').textContent = `${s.root} | journal ${s.journal_count} 条 / ${fmtBytes(s.journal_size_mb)} | journal episode_id ${s.journal_episode_count} 个 | episodes pkl ${s.episodes.length} 个`;
+      setPathStatus(`已打开: ${s.root}`);
+      window.episodes = s.episodes;
+      renderItems();
+      return s;
+    }
+
+    function renderItems() {
+      const q = $('filter').value.toLowerCase();
+      if (state.mode === 'journal') {
+        const items = (state.overview?.journal_episodes || []).filter(e => `${e.episode_id}`.includes(q));
+        $('episodeList').innerHTML = items.map(e =>
+          `<button class="episode" data-episode-id="${e.episode_id}">episode_id ${e.episode_id}<small>timeline ${e.timeline_len} | transitions ${e.transition_count}</small></button>`).join('');
+        $('episodeList').querySelectorAll('button').forEach(b => b.onclick = () => selectJournalEpisode(Number(b.dataset.episodeId)));
+      } else {
+        $('episodeList').innerHTML = (window.episodes || []).filter(e => e.name.toLowerCase().includes(q)).map(e =>
+          `<button class="episode" data-name="${e.name}">${e.name}<small>${fmtBytes(e.size_mb)}</small></button>`).join('');
+        $('episodeList').querySelectorAll('button').forEach(b => b.onclick = () => selectEpisode(b.dataset.name));
+      }
+    }
+
+    async function loadJournal() {
+      setBusy('loading journal');
+      state.mode = 'journal'; state.selectedEpisode = null; state.frame = 0; state.prefetched.clear(); stopPlayback();
+      $('tabJournal').classList.add('active'); $('tabEpisodes').classList.remove('active'); $('episodeList').classList.remove('hidden'); $('filter').classList.remove('hidden'); $('filter').placeholder = '过滤 journal episode_id';
+      state.overview = await api('/api/journal/overview');
+      state.count = 0;
+      $('structure').innerHTML = renderTree(state.overview.structure);
+      $('curveTitle').textContent = '当前 journal episode_id 整体曲线';
+      $('fieldDescriptions').textContent = JSON.stringify(state.overview.field_descriptions || {}, null, 2);
+      state.activeCurves = [];
+      renderItems();
+      const first = state.selectedJournalEpisode && state.overview.journal_episodes.some(e => e.episode_id === state.selectedJournalEpisode)
+        ? state.selectedJournalEpisode
+        : (state.overview.journal_episodes[0]?.episode_id ?? null);
+      if (first != null) {
+        await selectJournalEpisode(first);
+      } else {
+        setupTimeline();
+        $('frameData').textContent = 'no journal episodes';
+      }
+    }
+
+    async function selectEpisode(name) {
+      setBusy(`loading ${name}`);
+      state.mode = 'episode'; state.selectedEpisode = name; state.frame = 0; state.prefetched.clear(); stopPlayback();
+      state.overview = await api(`/api/episode/${encodeURIComponent(name)}/overview`);
+      state.count = state.overview.count;
+      $('structure').innerHTML = renderTree(state.overview.structure);
+      $('curveTitle').textContent = '跨 observation / step 曲线';
+      $('fieldDescriptions').textContent = '当前页面按 pkl 原始数组逐点绘制，不做平滑、平均、差值或异常判断。';
+      setupTimeline();
+      setupCurves(state.overview.curves);
+      await loadFrame(0);
+    }
+
+    async function selectJournalEpisode(episodeId) {
+      setBusy(`loading journal episode_id ${episodeId}`);
+      state.selectedJournalEpisode = episodeId;
+      state.frame = 0;
+      stopPlayback();
+      const data = await api(`/api/journal/episode/${episodeId}/overview`);
+      state.count = data.timeline_len;
+      $('curveTitle').textContent = `journal episode_id ${episodeId} 整体曲线`;
+      $('fieldDescriptions').textContent = JSON.stringify(state.overview.field_descriptions || {}, null, 2);
+      setupTimeline();
+      setupCurves(data.curves || []);
+      await loadFrame(0);
+    }
+
+    function setupTimeline() {
+      $('slider').max = Math.max(0, state.count - 1); $('slider').value = state.frame; updateFrameText();
+    }
+
+    function updateFrameText() { $('frameText').textContent = `${state.frame + 1} / ${state.count}`; $('slider').value = state.frame; drawChart(); }
+
+    async function loadFrame(idx) {
+      if (!state.count) return;
+      const target = Math.max(0, Math.min(idx, state.count - 1));
+      if (state.loadingFrame) { state.pendingFrame = target; return; }
+      state.loadingFrame = true;
+      state.frame = target;
+      state.pendingFrame = null;
+      updateFrameText();
+      try {
+        const url = state.mode === 'journal'
+          ? `/api/journal/episode/${state.selectedJournalEpisode}/frame/${state.frame}`
+          : `/api/episode/${encodeURIComponent(state.selectedEpisode)}/frame/${state.frame}`;
+        const data = await api(url);
+        if (state.mode === 'episode' && Number.isFinite(data.idx)) {
+          state.frame = data.idx;
+          updateFrameText();
+        } else if (state.mode === 'journal' && Number.isFinite(data.x)) {
+          state.frame = data.x;
+          updateFrameText();
+        }
+        $('frameData').textContent = JSON.stringify(data, null, 2);
+        renderMedia(data);
+        preloadNext(data);
+      } finally {
+        state.loadingFrame = false;
+        if (state.pendingFrame != null && state.pendingFrame !== state.frame) {
+          const next = state.pendingFrame;
+          state.pendingFrame = null;
+          loadFrame(next);
+        }
+      }
+    }
+
+    function renderMedia(data) {
+      $('media').innerHTML = '';
+      if (state.mode !== 'episode') return;
+      const cams = data.cameras || [];
+      const frameIdx = Number.isFinite(data.idx) ? data.idx : state.frame;
+      $('media').innerHTML = cams.map(cam => `<div class="cam"><label>${escapeHtml(cam)}</label><img src="/api/episode/${encodeURIComponent(state.selectedEpisode)}/image/${frameIdx}/${encodeURIComponent(cam)}.png"></div>`).join('');
+    }
+
+    function preloadNext(data) {
+      if (state.mode !== 'episode' || state.count < 2) return;
+      const windowSize = Number($('speed').value) <= 42 ? 10 : 6;
+      for (let offset = 1; offset <= windowSize; offset++) {
+        const next = (state.frame + offset) % state.count;
+        (data.cameras || []).forEach(cam => {
+          const key = `${state.selectedEpisode}|${next}|${cam}`;
+          if (state.prefetched.has(key)) return;
+          state.prefetched.add(key);
+          const img = new Image();
+          img.src = `/api/episode/${encodeURIComponent(state.selectedEpisode)}/image/${next}/${encodeURIComponent(cam)}.png`;
+        });
+      }
+      if (state.prefetched.size > 800) state.prefetched.clear();
+    }
+
+    function stopPlayback() {
+      state.timer = false;
+      state.lastTick = 0;
+      $('play').textContent = '▶';
+    }
+
+    function playbackStep(ts) {
+      if (!state.timer) return;
+      const interval = Number($('speed').value);
+      if (!state.lastTick) state.lastTick = ts;
+      const elapsed = ts - state.lastTick;
+      if (elapsed >= interval) {
+        const steps = Math.max(1, Math.min(6, Math.floor(elapsed / interval)));
+        state.lastTick += steps * interval;
+        const next = (state.frame + steps) % state.count;
+        loadFrame(next);
+      }
+      requestAnimationFrame(playbackStep);
+    }
+
+    function playToggle() {
+      if (state.timer) { stopPlayback(); return; }
+      state.timer = true;
+      state.lastTick = 0;
+      $('play').textContent = 'Ⅱ';
+      requestAnimationFrame(playbackStep);
+    }
+
+    async function applyDataRoot() {
+      const path = $('dataRoot').value.trim();
+      if (!path) {
+        setPathStatus('请输入 replay 目录路径', true);
+        return;
+      }
+      if (state.pickedHandle && !path.includes('/') && !path.includes('\\')) {
+        await importPickedDirectory(state.pickedHandle);
+        return;
+      }
+      try {
+        await api('/api/set-data-root', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path }),
+        });
+        await loadSummary();
+        await loadJournal();
+      } catch (e) {
+        setPathStatus(String(e), true);
+      }
+    }
+
+    async function importPickedDirectory(handle) {
+      setPathStatus('正在导入所选 replay 目录，请稍等...');
+      setBusy('importing selected replay directory');
+      try {
+        const journalHandle = await handle.getFileHandle('replay_journal.pkl');
+        const episodesHandle = await handle.getDirectoryHandle('episodes');
+        const form = new FormData();
+        form.append('replay_journal', await journalHandle.getFile(), 'replay_journal.pkl');
+        for await (const entry of episodesHandle.values()) {
+          if (entry.kind !== 'file' || !entry.name.endsWith('.pkl')) continue;
+          form.append('episode_files', await entry.getFile(), entry.name);
+        }
+        await api('/api/import-picked-root', { method: 'POST', body: form });
+        await loadSummary();
+        await loadJournal();
+        setPathStatus('已导入并打开所选 replay 目录');
+      } catch (e) {
+        setPathStatus(String(e), true);
+        throw e;
+      }
+    }
+
+    async function pickDirectory() {
+      if (!window.showDirectoryPicker) {
+        setPathStatus('当前浏览器不支持目录选择器，请手动粘贴路径', true);
+        return;
+      }
+      try {
+        const handle = await window.showDirectoryPicker();
+        state.pickedHandle = handle;
+        $('dataRoot').value = handle.name;
+        setPathStatus('已选择目录，点击“打开”后会把 pkl 导入到本机临时目录');
+      } catch (e) {
+        if (e && e.name !== 'AbortError') setPathStatus(String(e), true);
+      }
+    }
+
+    $('tabJournal').onclick = loadJournal;
+    $('tabEpisodes').onclick = () => {
+      $('tabJournal').classList.remove('active');
+      $('tabEpisodes').classList.add('active');
+      $('episodeList').classList.remove('hidden');
+      $('filter').classList.remove('hidden');
+      $('filter').placeholder = '过滤 episode 文件名';
+      state.mode = 'episode';
+      renderItems();
+      const nextEpisode = state.selectedEpisode || window.episodes?.[0]?.name;
+      if (nextEpisode) selectEpisode(nextEpisode);
+    };
+    $('filter').oninput = renderItems;
+    $('slider').oninput = e => loadFrame(Number(e.target.value));
+    $('prev').onclick = () => loadFrame(state.frame - 1);
+    $('next').onclick = () => loadFrame(state.frame + 1);
+    $('play').onclick = playToggle;
+    $('speed').onchange = () => { if (state.timer) { state.lastTick = 0; } };
+    $('clearCurves').onclick = () => { state.curves.clear(); $('curves').querySelectorAll('input').forEach(i => i.checked = false); drawChart(); };
+    $('applyDir').onclick = applyDataRoot;
+    $('pickDir').onclick = pickDirectory;
+    $('dataRoot').onkeydown = e => { if (e.key === 'Enter') applyDataRoot(); };
+    window.onresize = drawChart;
+
+    loadCurrentRoot().then(loadSummary).then(loadJournal).catch(async e => {
+      setBusy(String(e));
+      setPathStatus(`当前目录不可用: ${e}`, true);
+      await loadCurrentRoot();
+    });
+  </script>
+</body>
+</html>

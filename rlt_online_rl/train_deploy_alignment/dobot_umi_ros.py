@@ -1210,7 +1210,7 @@ class DobotUMIRobotBridge:
             "prompt": task,
         }
 
-    def send_action(self, action7: np.ndarray, *, _source: str = "policy") -> None:
+    def send_action(self, action7: np.ndarray, *, _source: str = "policy") -> np.ndarray:
         """执行 7D 动作。
 
         action7 格式：[j1..j6 rad, gripper_m]（关节角 + 夹爪，与 replay buffer 记录格式一致）。
@@ -1239,6 +1239,7 @@ class DobotUMIRobotBridge:
             )
             # self._arm.servo_j(q6_desired, t=0.1)
             # self._gripper.set_opening_m(gripper_m_desired)
+            return np.concatenate([q6_desired.astype(np.float32, copy=False), np.asarray([gripper_m_desired], dtype=np.float32)])
         else:
             # ── 人工接管（UMI teleop）：逐步限幅后 servo_j 下发 ──
             max_dq = float(getattr(self._args, "teleop_max_delta_rad",
@@ -1290,6 +1291,9 @@ class DobotUMIRobotBridge:
             servo_t = max(0.1, 1.0 / control_hz)
             self._arm.servo_j(self._ema_q6, t=servo_t)
             self._gripper.set_opening_m(gripper_m)
+            return np.concatenate(
+                [self._ema_q6.astype(np.float32, copy=False), np.asarray([gripper_m], dtype=np.float32)]
+            )
 
     def reset_teleop_state(self) -> None:
         """每次切换到 teleop 模式前调用，清除上次发送记录，强制首步以实测为基准。"""
@@ -1324,8 +1328,7 @@ class DobotUMIEnvAdapter(PikaChunkEnvAdapter):
         logger.warning("[DobotUMIEnvAdapter] super() 返回 action_deg=%s，调用 send_action(teleop)",
                     np.round(np.rad2deg(action[:6]), 2).tolist())
         # 主动将 IK 计算出的关节角目标发送给机械臂（teleop 路径，ServoJ 执行）
-        self._robot.send_action(action, _source="teleop")
-        return action
+        return self._robot.send_action(action, _source="teleop")
 
     def _reset_robot_to_mode_start(self) -> None:
         """覆盖父类方法：用 MovJ 代替 ServoJ 插值，实现安全的大幅度归位运动。
