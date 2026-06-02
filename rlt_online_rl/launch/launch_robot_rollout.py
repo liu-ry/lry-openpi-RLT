@@ -4,12 +4,45 @@ from __future__ import annotations
 import http.client
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+
+def _apply_ros_workspace(setup_bash: str) -> bool:
+    """在 os.execv 之前 source ROS2 工作空间，确保子进程继承正确的
+    LD_LIBRARY_PATH / PYTHONPATH 等环境变量（动态链接器在进程启动时读取）。
+    """
+    setup_path = Path(setup_bash).expanduser().resolve()
+    if not setup_path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["bash", "-c", f"source {setup_path} && env -0"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return False
+        for item in result.stdout.split("\0"):
+            if "=" in item:
+                k, _, v = item.partition("=")
+                if k in ("LD_LIBRARY_PATH", "PYTHONPATH", "AMENT_PREFIX_PATH",
+                         "PATH", "AMENT_CURRENT_PREFIX", "ROS_DISTRO",
+                         "AMENT_PYTHON_EXECUTABLE"):
+                    os.environ[k] = v
+        # 同步 PYTHONPATH → sys.path（对当前进程也生效，便于后续 import）
+        for p in os.environ.get("PYTHONPATH", "").split(":"):
+            if p and p not in sys.path:
+                sys.path.insert(0, p)
+        return True
+    except Exception as e:
+        print(f"[launch_robot_rollout] _apply_ros_workspace 失败: {e}", flush=True)
+        return False
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT_OUTER = REPO_ROOT.parent  # lry-openpi-RLT 仓库根目录（third_party 在此）
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -81,6 +114,18 @@ def main() -> None:
     print(f"[launch_robot_rollout] waiting for replay_manager at {replay_service_url}", flush=True)
     _wait_for_http(f"{replay_service_url.rstrip('/')}/stats")
     print(f"[launch_robot_rollout] services ready, starting {ros_script.name}.", flush=True)
+
+    # ── 在 execv 前 source ROS2 工作空间，让子进程继承完整的 LD_LIBRARY_PATH ──
+    # 候选顺序：仓库内自带 → 外部 handheld-umi_ws
+    _ws_candidates = [
+        REPO_ROOT_OUTER / "third_party" / "ros2_msgs_ws" / "install" / "setup.bash",
+        REPO_ROOT_OUTER.parent / "handheld-umi_ws" / "install" / "setup.bash",
+        Path.home() / "handheld-umi_ws" / "install" / "setup.bash",
+    ]
+    for _ws in _ws_candidates:
+        if _apply_ros_workspace(str(_ws)):
+            print(f"[launch_robot_rollout] sourced {_ws}", flush=True)
+            break
 
     os.chdir(REPO_ROOT)
     os.execv(sys.executable, [sys.executable, str(ros_script), *argv])

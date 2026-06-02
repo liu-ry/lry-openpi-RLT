@@ -1,0 +1,7 @@
+# -------------- 请求部分（MCU → ROS）--------------
+bool sync_request          # 固定为true，标记MCU需要进行设备同步
+
+# -------------- 响应部分（ROS → MCU）--------------
+---
+std_msgs/Header header
+bool sync_state            # ROS 端同步是否成功（true/false）

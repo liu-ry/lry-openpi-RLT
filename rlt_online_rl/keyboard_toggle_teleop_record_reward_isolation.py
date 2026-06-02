@@ -163,12 +163,24 @@ class KeyboardTeleopRecordRewardToggle(Node):
         self.get_logger().info(message)
         return True
 
-    def _record_terminal(self, client, label: str) -> None:
+    def _record_terminal(self, client, label: str, *, wait_for_episode_sec: float = 10.0, poll_interval: float = 0.5) -> None:
         if not self.refresh_teleop_mode():
             return
         if self.control_mode == "reset":
-            self.get_logger().warn(f"Cannot record {label}: episode inactive/reset in progress.")
-            return
+            # Episode may still be transitioning from reset → active; wait a bit before giving up.
+            deadline = time.monotonic() + wait_for_episode_sec
+            self.get_logger().info(
+                f"Mode is reset, waiting up to {wait_for_episode_sec:.0f}s for episode to start..."
+            )
+            while time.monotonic() < deadline:
+                time.sleep(poll_interval)
+                if not self.refresh_teleop_mode():
+                    return
+                if self.control_mode != "reset":
+                    break
+            else:
+                self.get_logger().warn(f"Cannot record {label}: episode inactive/reset in progress.")
+                return
         if self.control_mode == "teleop":
             if not self._toggle_hardware_teleop(reason=f"{label} end"):
                 return

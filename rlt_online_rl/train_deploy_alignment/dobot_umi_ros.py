@@ -23,6 +23,7 @@ import argparse
 from collections import deque
 import dataclasses
 import logging
+import os
 from pathlib import Path
 import sys
 import threading
@@ -90,6 +91,69 @@ try:
     _HAS_MOTOR_SDK = True
 except ImportError:
     _HAS_MOTOR_SDK = False
+
+# ── 自动 source ROS2 工作空间（获取 common_msgs 等消息定义）────────────────
+def _source_ros_workspace(setup_bash: str) -> bool:
+    """运行 `bash -c 'source <setup_bash> && env -0'`，将新增的环境变量写入
+    当前进程的 os.environ，并同步 PYTHONPATH 到 sys.path。
+    返回 True 表示成功，False 表示文件不存在或执行失败。
+    """
+    import subprocess
+    setup_path = Path(setup_bash).expanduser().resolve()
+    if not setup_path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["bash", "-c", f"source {setup_path} && env -0"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return False
+        for item in result.stdout.split("\0"):
+            if "=" in item:
+                k, _, v = item.partition("=")
+                if k in ("PYTHONPATH", "AMENT_PREFIX_PATH", "LD_LIBRARY_PATH",
+                         "PATH", "AMENT_CURRENT_PREFIX", "ROS_DISTRO"):
+                    os.environ[k] = v
+        for p in os.environ.get("PYTHONPATH", "").split(":"):
+            if p and p not in sys.path:
+                sys.path.insert(0, p)
+        return True
+    except Exception as _e:
+        logging.getLogger(__name__).warning("[_source_ros_workspace] 失败: %s", _e)
+        return False
+
+# 尝试导入 common_msgs；失败时按候选路径顺序自动 source 后重试。
+# 候选优先级：
+#   ① 仓库内自带（third_party/ros2_msgs_ws）—— 首次使用需运行：
+#        bash third_party/ros2_msgs_ws/build_msgs.sh
+#   ② 外部 handheld-umi_ws（兼容旧环境，不强依赖）
+_UMI_WS_CANDIDATES = [
+    _REPO_ROOT_OUTER / "third_party" / "ros2_msgs_ws" / "install" / "setup.bash",
+    _REPO_ROOT_OUTER.parents[1] / "handheld-umi_ws" / "install" / "setup.bash",
+    Path.home() / "handheld-umi_ws" / "install" / "setup.bash",
+    Path("/opt/handheld-umi_ws/install/setup.bash"),
+]
+try:
+    from common_msgs.msg import EncoderState as UMIEncoderState  # type: ignore[import]
+    _HAS_ENCODER_STATE = True
+except ImportError:
+    _HAS_ENCODER_STATE = False
+    UMIEncoderState = None  # type: ignore[assignment,misc]
+    for _candidate in _UMI_WS_CANDIDATES:
+        if _source_ros_workspace(str(_candidate)):
+            logging.getLogger(__name__).info("[init] 已自动 source %s", _candidate)
+            try:
+                from common_msgs.msg import EncoderState as UMIEncoderState  # type: ignore[import]
+                _HAS_ENCODER_STATE = True
+            except ImportError:
+                pass
+            break
+    if not _HAS_ENCODER_STATE:
+        logging.getLogger(__name__).warning(
+            "[init] common_msgs 不可用。\n"
+            "  请先运行：bash third_party/ros2_msgs_ws/build_msgs.sh"
+        )
 
 import re as _re
 _RESP_PAT = _re.compile(r"(-?\d+),?\{?([\d.,\-\s]*)\}?")
@@ -173,10 +237,10 @@ DEFAULT_DOBOT_DASHBOARD_PORT = 29999
 DEFAULT_DOBOT_FEEDBACK_PORT  = 30004
 
 # 知行夹爪 SDK（RS-485 串口）
-DEFAULT_GRIPPER_PORT      = "/dev/ttyUSB1"
+DEFAULT_GRIPPER_PORT      = "/dev/ttyUSB0"
 DEFAULT_GRIPPER_SLAVE_ID  = 1
 DEFAULT_GRIPPER_BAUDRATE  = 115200
-DEFAULT_GRIPPER_SPEED_PCT = 5
+DEFAULT_GRIPPER_SPEED_PCT = 30
 DEFAULT_GRIPPER_FORCE_PCT = 50
 DEFAULT_GRIPPER_POS_CLOSE = 12000   # 编码器完全闭合位置
 
@@ -185,9 +249,10 @@ DEFAULT_CAM_FRONT_TOPIC    = "/cam_front/color/image_raw"
 DEFAULT_CAM_WRIST_TOPIC    = "/cam_wrist/color/image_raw"
 
 # UMI 设备（ROS 话题）
-DEFAULT_UMI_VIO_POSE_TOPIC = "/umi1/vio/pose"      # VIO 末端位姿（PoseStamped）
-DEFAULT_UMI_ACTION_TOPIC   = "/umi/human_action"    # 旧版 7D 关节动作（向后兼容）
-DEFAULT_TELEOP_TRIGGER_SVC = "/umi/teleop_trigger"
+DEFAULT_UMI_VIO_POSE_TOPIC     = "/umi1/vio/pose"           # VIO 末端位姿（PoseStamped）
+DEFAULT_UMI_ACTION_TOPIC       = "/umi/human_action"         # 旧版 7D 关节动作（向后兼容）
+DEFAULT_TELEOP_TRIGGER_SVC     = "/umi/teleop_trigger"
+DEFAULT_UMI_ENCODER_TOPIC      = "/umi1/vitai/encoder_state" # UMI 手柄夹爪编码器话题
 
 # 夹爪物理行程（m）
 GRIPPER_MAX_M = 0.085
@@ -603,6 +668,17 @@ class ZhixingSDKGripper:
         self._force_pct = force_pct
         self._motor = None
         self._lock = threading.Lock()
+        # 上次实际发送的编码器目标位置
+        self._last_sent_pos: int | None = None
+        # 死区：20 个编码器单位 ≈ 0.14mm，过滤真正的噪声
+        self._pos_deadband: int = 20
+        # 异步发送：_pending_pos 由回调更新，后台线程以固定 20Hz 发送
+        self._pending_pos: int | None = None
+        # EMA 平滑目标位置（浮点，发送时取整）；alpha 越小越平滑，0.4 ≈ ~75ms 时间常数@20Hz
+        self._ema_pos: float | None = None
+        self._ema_alpha: float = 0.4
+        self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
+        self._send_thread.start()
 
     def init(self) -> bool:
         try:
@@ -617,29 +693,60 @@ class ZhixingSDKGripper:
             logger.error(f"[ZhixingSDKGripper] 初始化失败: {e}")
             return False
 
+    def _send_loop(self) -> None:
+        """后台线程：以 20Hz 将 EMA 平滑后的目标位置发送给夹爪。
+
+        关键设计：锁内只做轻量内存计算，Modbus I/O 在锁外执行，
+        避免长时间持锁阻塞主线程的 set_opening_m / get_position_m。
+        """
+        while True:
+            time.sleep(0.05)  # 20Hz
+            # ── 锁内：只读/写内存变量 ──────────────────────────────────────
+            with self._lock:
+                if self._motor is None or self._pending_pos is None:
+                    continue
+                # EMA 平滑
+                if self._ema_pos is None:
+                    self._ema_pos = float(self._pending_pos)
+                else:
+                    self._ema_pos = (self._ema_alpha * self._pending_pos
+                                     + (1.0 - self._ema_alpha) * self._ema_pos)
+                pos = int(round(self._ema_pos))
+                # 死区过滤
+                if (self._last_sent_pos is not None
+                        and abs(pos - self._last_sent_pos) < self._pos_deadband):
+                    continue
+                self._last_sent_pos = pos
+                motor = self._motor  # 拿到引用，锁外使用
+            # ── 锁外：做 Modbus I/O（MotorController 内部已有线程锁）───────
+            try:
+                motor.set_target_position(pos)
+                motor.trigger_motion()
+            except Exception as e:
+                logger.warning("[ZhixingSDKGripper] _send_loop Modbus 异常: %s", e)
+
     def set_opening_m(self, distance_m: float) -> None:
         d = float(np.clip(distance_m, 0.0, GRIPPER_MAX_M))
         ratio = 1.0 - d / GRIPPER_MAX_M
         pos = int(ratio * DEFAULT_GRIPPER_POS_CLOSE)
         with self._lock:
-            if self._motor is None:
-                return
-            try:
-                self._motor.set_target_position(pos)
-                self._motor.trigger_motion()
-            except Exception as e:
-                logger.warning("[ZhixingSDKGripper] set_opening_m 失败（Modbus 异常，跳过）: %s", e)
+            # 只更新 pending，由后台线程实际发送（避免阻塞调用方）
+            self._pending_pos = pos
 
     def get_position_m(self) -> float:
+        """返回夹爪当前位置估计（米）。
+
+        直接使用缓存的 EMA 目标值（不触发 Modbus 读取），避免阻塞主控制线程。
+        _ema_pos 是我们发给夹爪的平滑目标，是夹爪实际位置的最佳估计。
+        """
         with self._lock:
-            if self._motor is None:
-                return 0.0
-            try:
-                pos = self._motor.read_real_position()
-                ratio = pos / max(DEFAULT_GRIPPER_POS_CLOSE, 1)
-                return (1.0 - ratio) * GRIPPER_MAX_M
-            except Exception:
-                return 0.0
+            if self._ema_pos is not None:
+                ratio = self._ema_pos / max(DEFAULT_GRIPPER_POS_CLOSE, 1)
+                return float(np.clip((1.0 - ratio) * GRIPPER_MAX_M, 0.0, GRIPPER_MAX_M))
+            if self._last_sent_pos is not None:
+                ratio = self._last_sent_pos / max(DEFAULT_GRIPPER_POS_CLOSE, 1)
+                return float(np.clip((1.0 - ratio) * GRIPPER_MAX_M, 0.0, GRIPPER_MAX_M))
+            return 0.0
 
     def open(self) -> None:
         self.set_opening_m(GRIPPER_MAX_M)
@@ -689,6 +796,9 @@ class UMIPoseRecorder(Node):
         max_gripper_m: float = GRIPPER_MAX_M,
         R_align: np.ndarray | None = None,
         R_align_rot: np.ndarray | None = None,
+        motion_scale: float = 1.0,
+        smooth_alpha: float = 1.0,
+        encoder_topic: str | None = DEFAULT_UMI_ENCODER_TOPIC,
     ):
         super().__init__("umi_pose_recorder")
         if not _HAS_SCIPY:
@@ -713,10 +823,22 @@ class UMIPoseRecorder(Node):
             logger.info("[UMIPoseRecorder] R_align(rotation)=\n%s", self._R_align_rot)
         else:
             self._R_align_rot = self._R_align  # 默认与平移对齐矩阵相同
+        # motion_scale: UMI 增量缩放系数（平移和旋转同时缩放）
+        self._motion_scale = float(motion_scale)
+        logger.info("[UMIPoseRecorder] motion_scale=%.3f", self._motion_scale)
+        # smooth_alpha: EMA 平滑系数（0<α≤1）。1.0=不平滑，越小越平滑
+        self._smooth_alpha = float(np.clip(smooth_alpha, 0.0, 1.0))
+        logger.info("[UMIPoseRecorder] smooth_alpha=%.3f", self._smooth_alpha)
+
+        # UMI 手柄夹爪编码器：使用 cal_encoder_position 几何映射（正弦公式）
+        self._latest_umi_gripper_angle: float | None = None  # 最新编码器角度（度），None=未收到
+
         self._lock = threading.Lock()
 
         # 最新 UMI 末端位姿（4×4，VIO 世界坐标系）
         self._latest_T: np.ndarray | None = None
+        # EMA 平滑后的 UMI 末端位姿（4×4）
+        self._smooth_T: np.ndarray | None = None
         self._latest_seq: int = -1
 
         # 对齐参考帧（按 't' 时记录）
@@ -730,7 +852,57 @@ class UMIPoseRecorder(Node):
         self.create_subscription(ROSPoseStamped, pose_topic, self._on_pose, 50)
         self.get_logger().info(f"UMI VIO 位姿话题: {pose_topic}")
 
+        # UMI 夹爪编码器订阅
+        if encoder_topic and _HAS_ENCODER_STATE:
+            self.create_subscription(
+                UMIEncoderState, encoder_topic, self._on_encoder_state,
+                qos_profile_sensor_data,
+            )
+            self.get_logger().info(
+                f"UMI 夹爪编码器话题: {encoder_topic}  "
+                f"(cal_encoder_position 正弦映射 → [0, {self._max_gripper_m * 1000:.1f}mm])"
+            )
+        elif encoder_topic and not _HAS_ENCODER_STATE:
+            self.get_logger().warn(
+                "common_msgs 不可用，UMI 夹爪编码器话题已禁用。"
+                "请 source handheld-umi_ws/install/setup.bash 后重启。"
+            )
+
     # ── 内部工具 ──────────────────────────────────────────────────────────────
+
+    def _umi_gripper_angle_to_m(self, angle_deg: float) -> float:
+        """将 UMI 手柄夹爪编码器角度（度）转换为机械臂夹爪开合量（米）。
+
+        实测标定：
+            angle = 0°  → UMI 完全张开 → 机械臂夹爪完全张开（max_gripper_m）
+            angle = 50° → UMI 完全闭合 → 机械臂夹爪完全闭合（0 m）
+
+        方向与原始 cal_encoder_position 相反（角度越大 = 越闭合），
+        因此先用 cal_encoder_position 计算几何位移，再归一化后取反：
+
+            pos_at_angle   = cal_encoder_position(angle)
+            pos_at_closed  = cal_encoder_position(UMI_GRIPPER_CLOSED_DEG)  # ~50°
+            ratio_closed   = clip(pos_at_angle / pos_at_closed, 0, 1)
+            gripper_m      = (1 - ratio_closed) * max_gripper_m
+
+        即：angle=0 → ratio=0 → gripper_m=max（张开）
+            angle=50 → ratio=1 → gripper_m=0（闭合）
+        """
+        import math as _math
+        _BASE_RAD        = _math.radians(34.02)
+        _ORIGIN_HYPO_MM  = 42.0
+        # UMI 手柄完全闭合时对应的编码器角度（度），由实测标定
+        _CLOSED_DEG      = 50.0
+
+        def _cal(deg: float) -> float:
+            rad = _math.radians(max(0.0, deg))
+            return 2.0 * (_math.sin(_BASE_RAD) - _math.sin(_BASE_RAD - rad)) * _ORIGIN_HYPO_MM
+
+        pos_at_angle  = _cal(angle_deg)
+        pos_at_closed = _cal(_CLOSED_DEG)   # ≈ 70.17 mm
+
+        ratio_closed = float(np.clip(pos_at_angle / max(pos_at_closed, 1e-6), 0.0, 1.0))
+        return float(np.clip((1.0 - ratio_closed) * self._max_gripper_m, 0.0, self._max_gripper_m))
 
     @staticmethod
     def _pose_msg_to_matrix(msg) -> np.ndarray:
@@ -747,7 +919,48 @@ class UMIPoseRecorder(Node):
         T = self._pose_msg_to_matrix(msg.pose)
         with self._lock:
             self._latest_T = T
+            alpha = self._smooth_alpha
+            if self._smooth_T is None or alpha >= 1.0:
+                # 初始化或不平滑：直接赋值
+                self._smooth_T = T.copy()
+            else:
+                # 平移：线性 EMA
+                p_smooth = alpha * T[:3, 3] + (1.0 - alpha) * self._smooth_T[:3, 3]
+                # 旋转：四元数 NLERP（线性插值后归一化，近似 SLERP，无额外依赖）
+                q_curr = _Rotation.from_matrix(T[:3, :3]).as_quat()
+                q_prev = _Rotation.from_matrix(self._smooth_T[:3, :3]).as_quat()
+                # 保证插值走短弧（避免符号翻转导致绕远路）
+                if np.dot(q_curr, q_prev) < 0.0:
+                    q_curr = -q_curr
+                q_new = alpha * q_curr + (1.0 - alpha) * q_prev
+                q_new /= np.linalg.norm(q_new)
+                R_new = _Rotation.from_quat(q_new).as_matrix()
+                smooth = np.eye(4, dtype=np.float64)
+                smooth[:3, :3] = R_new
+                smooth[:3, 3] = p_smooth
+                self._smooth_T = smooth
             self._latest_seq += 1
+
+    def _on_encoder_state(self, msg) -> None:
+        """处理 /umi1/vitai/encoder_state 消息（common_msgs/EncoderState）。
+
+        直接在回调中调用 set_opening_m() 驱动机械臂夹爪，
+        不经过 snapshot_latest → send_action 流水线，保证夹爪响应及时。
+        内部死区过滤避免高频 Modbus 指令导致的抖动。
+        仅在编码器状态正常（ENCODER_OK=0）时执行。
+        """
+        if msg.encoder_status != 0:
+            return
+
+        angle = float(msg.gripper_angle)
+        with self._lock:
+            self._latest_umi_gripper_angle = angle
+
+        gripper_m = self._umi_gripper_angle_to_m(angle)
+        try:
+            self._gripper.set_opening_m(gripper_m)
+        except Exception as e:
+            self.get_logger().warn(f"[_on_encoder_state] 夹爪控制失败: {e}")
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
@@ -780,6 +993,8 @@ class UMIPoseRecorder(Node):
                 self._T_umi_ref = T_umi.copy()
                 self._T_ee_ref  = T_ee.copy()
                 self._q_ref     = q_now.copy()
+                # 对齐时同步重置平滑状态，防止旧滞后影响新基准
+                self._smooth_T  = T_umi.copy()
             logger.warning("[set_alignment_reference] ✅ 对齐参考帧写入完成 "
                            "T_umi_ref=%s T_ee_ref=%s q_ref=%s",
                            self._T_umi_ref is not None,
@@ -797,13 +1012,14 @@ class UMIPoseRecorder(Node):
         IK 失败时保持上一次输出；尚未对齐（'t' 未按）时原地保持当前关节角。
         """
         with self._lock:
-            T_umi_curr = self._latest_T
+            T_umi_curr = self._smooth_T      # ← 使用 EMA 平滑后的位姿
             seq        = self._latest_seq
             T_umi_ref  = self._T_umi_ref
             T_ee_ref   = self._T_ee_ref
             q_ref      = self._q_ref
 
-        # 实时读取夹爪当前位置（允许夹爪独立操控）
+        # 夹爪开合量：_on_encoder_state 已直接驱动物理夹爪，
+        # 此处直接读取物理夹爪当前实际位置，作为 action 的真实记录值。
         gripper_m = float(np.clip(self._gripper.get_position_m(), 0.0, self._max_gripper_m))
 
         def _hold_current() -> np.ndarray:
@@ -811,7 +1027,7 @@ class UMIPoseRecorder(Node):
             return np.concatenate([q, [gripper_m]], dtype=np.float32)
 
         if T_umi_curr is None:
-            logger.warning("[snapshot_latest] T_umi_curr is None → hold current (UMI 话题未收到数据?)")
+            logger.warning("[snapshot_latest] smooth_T is None → hold current (UMI 话题未收到数据?)")
             return _hold_current(), seq
 
         if T_umi_ref is None or T_ee_ref is None or q_ref is None:
@@ -839,6 +1055,14 @@ class UMIPoseRecorder(Node):
             delta_T_aligned[:3, :3] = Rr @ delta_T[:3, :3] @ Rr.T
         else:
             delta_T_aligned[:3, :3] = delta_T[:3, :3]
+
+        # ── motion_scale：缩放增量幅度，抑制抖动放大 ──────────────────────────
+        # 平移分量：直接线性缩放
+        # 旋转分量：将旋转向量（轴角）缩放后重建旋转矩阵
+        if self._motion_scale != 1.0:
+            delta_T_aligned[:3, 3] *= self._motion_scale
+            rvec = _Rotation.from_matrix(delta_T_aligned[:3, :3]).as_rotvec()
+            delta_T_aligned[:3, :3] = _Rotation.from_rotvec(rvec * self._motion_scale).as_matrix()
 
         T_ee_target = T_ee_ref @ delta_T_aligned
         # 就近选解：优先用上一次成功输出的关节角，初始时用对齐参考帧的关节角
@@ -925,7 +1149,7 @@ class DobotUMIRobotBridge:
     # 通过 args.teleop_max_delta_rad 覆盖。
     DEFAULT_TELEOP_MAX_DELTA_RAD: float = 0.05
     # teleop 夹爪每步最大变化量（米）
-    DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M: float = 0.008
+    DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M: float = 0.085  # 不限幅，允许全行程一步到位
 
     def __init__(
         self,
@@ -1242,6 +1466,9 @@ def parse_args() -> argparse.Namespace:
     # ── UMI 人为介入（ROS 话题） ─────────────────────────────────────────────
     parser.add_argument("--umi_vio_pose_topic", type=str, default=DEFAULT_UMI_VIO_POSE_TOPIC,
                         help="UMI VIO 末端位姿话题（geometry_msgs/PoseStamped）")
+    parser.add_argument("--umi_encoder_topic", type=str, default=DEFAULT_UMI_ENCODER_TOPIC,
+                        help="UMI 手柄夹爪编码器话题（common_msgs/EncoderState）。"
+                             "设为空字符串可禁用，改为读取机械臂侧物理夹爪位置。")
     parser.add_argument("--teleop_trigger_service", type=str, default=DEFAULT_TELEOP_TRIGGER_SVC)
     parser.add_argument("--policy_resume_delay_s", type=float, default=1.0)
     parser.add_argument("--start_in_human_mode", action="store_true")
@@ -1343,6 +1570,8 @@ def main() -> None:
     _r_align_rot_flat = getattr(system.env_driver, "umi_to_ee_R_align_rot", None)
     _R_align_rot = (np.asarray(_r_align_rot_flat, dtype=np.float64).reshape(3, 3)
                     if _r_align_rot_flat is not None else None)
+    _motion_scale = float(getattr(system.env_driver, "umi_motion_scale", 1.0))
+    _smooth_alpha = float(getattr(system.env_driver, "umi_smooth_alpha", 1.0))
     umi_pose_recorder = UMIPoseRecorder(
         pose_topic=args.umi_vio_pose_topic,
         arm=arm,
@@ -1350,6 +1579,9 @@ def main() -> None:
         max_gripper_m=args.max_gripper_m,
         R_align=_R_align,
         R_align_rot=_R_align_rot,
+        motion_scale=_motion_scale,
+        smooth_alpha=_smooth_alpha,
+        encoder_topic=args.umi_encoder_topic or None,
     )
 
     # UMI 触发服务（切换策略/人工模式，切换时自动对齐参考帧）

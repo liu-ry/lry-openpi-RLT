@@ -121,6 +121,10 @@ class EnvDriverConfig:
     umi_to_ee_R_align: list[float] | None = None
     # 单独用于旋转分量的对齐矩阵。None = 与 umi_to_ee_R_align 相同。
     umi_to_ee_R_align_rot: list[float] | None = None
+    # UMI 动作缩放系数（0 < a ≤ 1）：机械臂末端增量 = a × UMI 手柄增量，缩小响应幅度。
+    umi_motion_scale: float = 1.0
+    # UMI VIO 位姿 EMA 平滑系数（0 < alpha ≤ 1）：alpha=1 不平滑，越小越平滑但响应越慢。
+    umi_smooth_alpha: float = 1.0
 
 
 @dataclasses.dataclass(frozen=True)

@@ -1,0 +1,3 @@
+---
+bool succeeded
+sensor_msgs/Image bg_img

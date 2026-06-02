@@ -129,10 +129,22 @@ runtime:
     # umi_to_ee_R_align: [0, -1, 0,  1, 0, 0,  0, 0, 1]
     # X/Y 轴方向正确但符号相反 → 绕 Z 旋转 180°（X/Y 同时取负，Z 不变）：
     umi_to_ee_R_align: [-1, 0, 0,  0, -1, 0,  0, 0, 1]
-    # 旋转轴 X/Y 互换（UMI Rx→机械臂Ry，UMI Ry→机械臂Rx）
-    # 互换且 X 取负 → 绕 Z 轴 +90° CCW：[[0,-1,0],[1,0,0],[0,0,1]]
-    # 互换且 Y 取负 → 绕 Z 轴 -90° CW： [[0,1,0],[-1,0,0],[0,0,1]]
-    # umi_to_ee_R_align_rot 未配置 → 默认与 umi_to_ee_R_align 相同 (180° around Z: X/Y both flipped)
+    # ── 旋转增量单独对齐矩阵 ────────────────────────────────────────────────
+    # 实测（平移正确，旋转错误）：
+    #   UMI Rx+ → robot -Ry, UMI Ry+ → robot -Rx, UMI Rz+ → robot -Rz
+    # 有效旋转映射 M_current = [[0,-1,0],[-1,0,0],[0,0,-1]]
+    # VIO 旋转帧到物理 UMI 帧的固定变换 V = R_align.T @ M_current = [[0,1,0],[1,0,0],[0,0,-1]]
+    # 期望恒等映射: R_align_rot_new = V^{-1} = V^T = [[0,1,0],[1,0,0],[0,0,-1]]
+    # 即: UMI Rx→robot Rx, UMI Ry→robot Ry, UMI Rz→robot Rz
+    umi_to_ee_R_align_rot: [0, 1, 0,  1, 0, 0,  0, 0, -1]
+
+    # ── UMI 动作平滑与缩放 ────────────────────────────────────────────────────
+    # motion_scale: 机械臂末端增量 = a × UMI 手柄增量（平移 m 和旋转 rad 同时缩放）
+    #   建议范围 0.3 ~ 0.8，越小响应越柔和
+    umi_motion_scale: 0.8
+    # smooth_alpha: EMA 系数（0 < α ≤ 1）。α=1 不平滑，越小越平滑但延迟越大
+    #   建议范围 0.2 ~ 0.6；以 20 Hz 控制频率为例，α=0.4 时时间常数约 75 ms
+    umi_smooth_alpha: 0.4
 
     machine_a_connect_timeout_sec: 5.0
     machine_a_recv_timeout_sec: 5.0

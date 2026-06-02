@@ -19,6 +19,11 @@ metrics/
 *.jsonl
 *.wandb
 
+# ROS2 msgs workspace build artifacts (源码在 src/ 保留，build/install/log 不入库)
+third_party/ros2_msgs_ws/build/
+third_party/ros2_msgs_ws/install/
+third_party/ros2_msgs_ws/log/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
