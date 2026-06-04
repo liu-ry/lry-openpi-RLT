@@ -458,6 +458,7 @@ class LearnerService:
         self._warmup_ready_adds_total: int | None = None
         self._pending_update_budget = 0
         self._freeze_logged = False
+        self._last_ready_for_online = False
         restored = self._load_latest_checkpoint()
         if restored is not None:
             self._state = restored
@@ -478,6 +479,7 @@ class LearnerService:
     def train_once(self, *, stop_event: Any | None = None) -> dict[str, float] | None:
         stats = self._replay_source.stats()
         progress = self._refresh_progress(stats)
+        was_ready_for_online = self._last_ready_for_online
         if progress["replay_size"] < self._rl_config.warmup_min_size:
             now = time.time()
             if now - self._last_warmup_log_time >= 5.0:
@@ -567,6 +569,14 @@ class LearnerService:
             )
         self._maybe_save_checkpoint()
         self._maybe_export_actor_snapshot()
+        if bool(progress["ready_for_online"]) and not was_ready_for_online:
+            self.export_actor_snapshot(force=True)
+            logger.info(
+                "Exported final warmup actor snapshot actor_version=%s global_step=%s",
+                int(metrics["actor_version"]),
+                int(metrics["global_step"]),
+            )
+        self._last_ready_for_online = bool(progress["ready_for_online"])
         return metrics
 
     def run_forever(self, *, stop_event: Any | None = None) -> None:

@@ -742,6 +742,26 @@ class EnvDriver:
 
         while not done:
             plan_request_count = 0
+            replay_size_for_log: int | None = None
+            adds_total_for_log: int | None = None
+            if not self._eval_actor_only:
+                try:
+                    replay_stats_for_log = self._replay_client.stats()
+                    replay_size_for_log = int(replay_stats_for_log.get("size", 0))
+                    adds_total_for_log = int(replay_stats_for_log.get("adds_total", replay_size_for_log))
+                except Exception:
+                    replay_size_for_log = None
+                    adds_total_for_log = None
+            logger.info(
+                "EnvDriver episode=%s chunk=%s env_step_start=%s collection_phase=%s replay_size=%s/%s adds_total=%s",
+                episode_id,
+                step_id,
+                env_step_id,
+                collection_phase,
+                replay_size_for_log if replay_size_for_log is not None else -1,
+                self._rl_config.warmup_min_size,
+                adds_total_for_log if adds_total_for_log is not None else -1,
+            )
 
             def _policy_planner(plan_observation: dict[str, Any], local_step: int) -> PolicyPlan:
                 nonlocal fallback_count, intervention_count, plan_request_count

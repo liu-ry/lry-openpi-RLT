@@ -169,6 +169,9 @@ class RolloutRuntimeContext:
     def request_next_episode(self) -> None:
         self.set_signal(SIGNAL_NEXT_EPISODE_REQUESTED, True)
 
+    def has_pending_next_episode_request(self) -> bool:
+        return bool(self.get_signal(SIGNAL_NEXT_EPISODE_REQUESTED, False))
+
     def approve_online_transition(self) -> None:
         self.set_signal(SIGNAL_ONLINE_APPROVED, True)
 
@@ -246,6 +249,7 @@ class RolloutPhaseController:
         self._learner_status_getter: Callable[[], dict[str, Any]] | None = None
         self._online_approval_getter: Callable[[], bool] | None = None
         self._online_approval_consumer: Callable[[], bool] | None = None
+        self._next_episode_request_getter: Callable[[], bool] | None = None
         self._logged_initial = False
         self._last_wait_actor_version = -1
         self._last_wait_global_step = -1
@@ -266,6 +270,9 @@ class RolloutPhaseController:
 
     def bind_online_approval_consumer(self, consumer: Callable[[], bool]) -> None:
         self._online_approval_consumer = consumer
+
+    def bind_next_episode_request_getter(self, getter: Callable[[], bool]) -> None:
+        self._next_episode_request_getter = getter
 
     def begin_episode(self) -> str:
         if self._warmup_min_size <= 0:
@@ -380,15 +387,29 @@ class RolloutPhaseController:
     def _is_online_ready(self) -> bool:
         return self._is_actor_ready() and self._is_training_ready() and self._has_online_approval()
 
+    def _approval_source(self) -> str:
+        if not self._require_online_approval:
+            return "disabled"
+        implicit_request = False
+        if self._next_episode_request_getter is not None:
+            try:
+                implicit_request = bool(self._next_episode_request_getter())
+            except RuntimeError:
+                implicit_request = False
+        if implicit_request:
+            return "o"
+        if self._online_approval_getter is not None:
+            try:
+                if bool(self._online_approval_getter()):
+                    return "enter"
+            except RuntimeError:
+                pass
+        return "none"
+
     def _has_online_approval(self) -> bool:
         if not self._require_online_approval:
             return True
-        if self._online_approval_getter is None:
-            return False
-        try:
-            return bool(self._online_approval_getter())
-        except RuntimeError:
-            return False
+        return self._approval_source() != "none"
 
     def _consume_online_approval(self) -> bool:
         if not self._require_online_approval:
@@ -403,11 +424,16 @@ class RolloutPhaseController:
     def _try_enter_online(self) -> bool:
         if not (self._is_actor_ready() and self._is_training_ready()):
             return False
-        if not self._has_online_approval():
+        approval_source = self._approval_source()
+        if approval_source == "none":
             return False
         consumed = self._consume_online_approval()
         if not consumed and self._require_online_approval:
             return False
+        self._logger.info(
+            "Online approval consumed via %s; this next episode will start RL control.",
+            approval_source,
+        )
         return True
 
     def _wait_until_online_ready(self) -> None:
@@ -438,7 +464,7 @@ class RolloutPhaseController:
             ):
                 if actor_version >= self._min_online_actor_version and bool(learner_status.get("ready_for_online", False)):
                     self._logger.info(
-                        "Waiting for manual online approval actor_version=%s required=%s learner_updates=%s/%s approved=%s",
+                        "Waiting for manual online approval actor_version=%s required=%s learner_updates=%s/%s approved=%s. Press Enter or o to start RL on the next episode.",
                         actor_version,
                         self._min_online_actor_version,
                         learner_global_step,
@@ -1706,6 +1732,7 @@ def main() -> None:
     phase_controller.bind_learner_status_getter(_make_learner_status_reader(learner_status_path))
     phase_controller.bind_online_approval_getter(runtime_context.has_online_approval)
     phase_controller.bind_online_approval_consumer(runtime_context.consume_online_approval)
+    phase_controller.bind_next_episode_request_getter(runtime_context.has_pending_next_episode_request)
     actor_client = PhaseAwareActorClient(
         base_actor_client,
         phase_controller,

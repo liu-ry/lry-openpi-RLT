@@ -99,7 +99,7 @@ runtime:
     critical_phase_reset_action: [0.5793687, -0.1360939, 0.2334053, 3.14, 0.0, -1.57, 0.08]
 
     actor_deterministic: false
-    chunk_exec_horizon: 10
+    chunk_exec_horizon: 50
 
     # 越疆 Dobot 推荐控制频率：20 Hz
     control_frequency_hz: 20.0

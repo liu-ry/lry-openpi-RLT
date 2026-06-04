@@ -1832,6 +1832,7 @@ def main() -> None:
     logger.info("Actor service: %s", system.env_driver.actor_service_url)
     logger.info("Replay service: %s", system.env_driver.replay_service_url)
     logger.info("控制频率: %.2f Hz", system.env_driver.control_frequency_hz)
+    logger.info("Chunk 执行长度: %d", system.env_driver.chunk_exec_horizon)
     logger.info("任务模式: %s", system.env_driver.task_mode)
     logger.info("仅评估模式: %s", args.eval_actor_only)
     logger.info("Actor 确定性: %s", system.env_driver.actor_deterministic)
