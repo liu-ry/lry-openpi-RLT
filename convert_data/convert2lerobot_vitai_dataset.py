@@ -8,6 +8,14 @@ import tyro
 import cv2
 from pathlib import Path
 
+def find_existing_file(base_dir, candidates):
+    """Return the first existing file path from candidates under base_dir."""
+    for name in candidates:
+        path = os.path.join(base_dir, name)
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"在 {base_dir} 下未找到任一文件: {candidates}")
+
 def extract_video_to_frames(video_path, target_height=480, target_width=640):
     """将视频文件转换为帧列表（使用 opencv）"""
     frames = []
@@ -97,15 +105,17 @@ def main(root_dir: str = "/home/lry/temp/sync",
             return     
     # 创建LeRobot数据集，定义要存储的特征
     # 新数据集格式：
-    #   robot_joint_velocity_force.npy -> (N, 18): 只取前6维（6自由度关节位置）
+    #   robot_joint.npy                -> (N, 6) : 6自由度关节位置
+    #   robot_velocity.npy             -> (N, 6) : 关节速度
+    #   robot_force.npy                -> (N, 6) : 关节力
     #   gripper.npy                    -> (N,)   : 夹爪开合值
     #   robot_tcp_pose.npy             -> (N, 7) : TCP末端位姿 (xyz + quaternion)
     #   realsense_top_rgb.mp4          -> 640x480 俯视相机
     #   realsense_wrist_rgb.mp4        -> 640x480 腕部相机
-    #   tactile_left_warped_image.mp4  -> 240x240 左触觉图像
-    #   tactile_right_warped_image.mp4 -> 240x240 右触觉图像
+    #   tactile_left.mp4               -> 240x240 左触觉图像
+    #   tactile_right.mp4              -> 240x240 右触觉图像
     #   timestamps.npy                 -> (N,)   : 时间戳
-    JOINT_DIM = 6    # 6自由度机械臂，只取 robot_joint_velocity_force 前6维
+    JOINT_DIM = 6    # 6自由度机械臂，直接读取 robot_joint.npy
     STATE_DIM = JOINT_DIM + 1   # 6 (joint) + 1 (gripper) = 7
     state_names = [f"joint_{i}" for i in range(JOINT_DIM)] + ["gripper"]
 
@@ -114,8 +124,8 @@ def main(root_dir: str = "/home/lry/temp/sync",
         robot_type="vitai",
         fps=30,
         features={
-            # 俯视 RGB 相机
-            "observation.images.cam_top": {
+            # 前视 RGB 相机
+            "observation.images.cam_front": {
                 "dtype": "image",
                 "shape": (480, 640, 3),
                 "names": ["height", "width", "channel"],
@@ -187,7 +197,9 @@ def main(root_dir: str = "/home/lry/temp/sync",
 
             try:
                 # 加载元数据（如果不存在则使用默认值）
-                metadata_path = os.path.join(episode_folder, "metadata.json")
+                metadata_path = find_existing_file(
+                    episode_folder, ["metadata.json", "meta.json"]
+                )
                 if os.path.exists(metadata_path):
                     with open(metadata_path, "r") as f:
                         metadata = json.load(f)
@@ -197,10 +209,18 @@ def main(root_dir: str = "/home/lry/temp/sync",
                 default_task = metadata.get("prompt", "robot manipulation task")
 
                 # ── 加载 numpy 数据 ──────────────────────────────────────────
-                # robot_joint_velocity_force: (N, 18)，只取前 JOINT_DIM=6 维
-                joint_vel_force = np.load(
-                    os.path.join(episode_folder, "robot_joint_velocity_force.npy")
-                ).astype(np.float32)[:, :JOINT_DIM]
+                # robot_joint: (N, 6)，直接作为关节位置输入
+                joint_pos = np.load(
+                    find_existing_file(
+                        episode_folder,
+                        ["robot_joint.npy", "robot_joint_velocity_force.npy"],
+                    )
+                ).astype(np.float32)
+                if joint_pos.ndim != 2 or joint_pos.shape[1] < JOINT_DIM:
+                    raise ValueError(
+                        f"robot_joint 数据形状异常: {joint_pos.shape}，期望至少为 (N, {JOINT_DIM})"
+                    )
+                joint_pos = joint_pos[:, :JOINT_DIM]
                 # gripper: (N,) → reshape 为 (N, 1) 方便拼接
                 gripper = np.load(
                     os.path.join(episode_folder, "gripper.npy")
@@ -209,19 +229,19 @@ def main(root_dir: str = "/home/lry/temp/sync",
                 timestamps = np.load(os.path.join(episode_folder, "timestamps.npy"))
 
                 # 拼接状态向量：(N, 6+1) = (N, 7)
-                state_pos = np.concatenate([joint_vel_force, gripper], axis=1)
+                state_pos = np.concatenate([joint_pos, gripper], axis=1)
 
                 # 动作 = 下一帧状态（最后一帧复制前一帧）
                 actions = get_action_from_state_pos(state_pos)
 
                 # ── 加载视频帧 ───────────────────────────────────────────────
                 video_files = {
-                    "observation.images.cam_top":   "realsense_top_rgb.mp4",
+                    "observation.images.cam_front": "realsense_top_rgb.mp4",
                     "observation.images.cam_wrist":  "realsense_wrist_rgb.mp4",
                 }
                 tactile_video_files = {
-                    "observation.images.tactile_left":  "tactile_left_warped_image.mp4",
-                    "observation.images.tactile_right": "tactile_right_warped_image.mp4",
+                    "observation.images.tactile_left":  ["tactile_left.mp4", "tactile_left_warped_image.mp4"],
+                    "observation.images.tactile_right": ["tactile_right.mp4", "tactile_right_warped_image.mp4"],
                 }
 
                 video_frames = {}
@@ -229,7 +249,7 @@ def main(root_dir: str = "/home/lry/temp/sync",
                     video_path = os.path.join(episode_folder, filename)
                     video_frames[key] = extract_video_to_frames(video_path)
                 for key, filename in tactile_video_files.items():
-                    video_path = os.path.join(episode_folder, filename)
+                    video_path = find_existing_file(episode_folder, filename)
                     video_frames[key] = extract_video_to_frames(
                         video_path, target_height=240, target_width=240
                     )
@@ -239,7 +259,7 @@ def main(root_dir: str = "/home/lry/temp/sync",
                     len(state_pos),
                     len(actions),
                     len(timestamps),
-                    len(video_frames["observation.images.cam_top"]),
+                    len(video_frames["observation.images.cam_front"]),
                     len(video_frames["observation.images.cam_wrist"]),
                     len(video_frames["observation.images.tactile_left"]),
                     len(video_frames["observation.images.tactile_right"]),
@@ -252,7 +272,7 @@ def main(root_dir: str = "/home/lry/temp/sync",
                 num_steps = len(timestamps)
                 for step_idx in range(num_steps):
                     frame_data = {
-                        "observation.images.cam_top":    video_frames["observation.images.cam_top"][step_idx],
+                        "observation.images.cam_front":  video_frames["observation.images.cam_front"][step_idx],
                         "observation.images.cam_wrist":  video_frames["observation.images.cam_wrist"][step_idx],
                         "observation.images.tactile_left":  video_frames["observation.images.tactile_left"][step_idx],
                         "observation.images.tactile_right": video_frames["observation.images.tactile_right"][step_idx],

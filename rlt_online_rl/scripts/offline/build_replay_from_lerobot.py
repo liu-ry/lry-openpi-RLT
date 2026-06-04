@@ -156,8 +156,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--image-keys",
         nargs="+",
-        default=["cam_top", "cam_wrist", "tactile_left", "tactile_right"],
-        help="Image keys to include in observations (default: cam_top cam_wrist tactile_left tactile_right).",
+        default=["cam_front", "cam_wrist", "tactile_left", "tactile_right"],
+        help="Image keys to include in observations (default: cam_front cam_wrist tactile_left tactile_right).",
     )
     p.add_argument(
         "--capacity",

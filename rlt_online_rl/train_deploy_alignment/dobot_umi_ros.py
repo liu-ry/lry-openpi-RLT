@@ -11,7 +11,7 @@
   4. HumanActionRecorder → UMIHumanActionRecorder：订阅 UMI 设备发布的示教动作话题
      /umi/human_action（UMI 设备仍走 ROS 话题）。
   5. TeleopTriggerNode 默认服务名改为 /umi/teleop_trigger。
-  6. get_observation() 返回 cam_front / cam_wrist 图像键。
+  6. get_observation() 对外统一返回 cam_front / cam_wrist 图像键。
   7. 默认配置文件指向 configs/tasks/dobot_umi/online_rl.yaml。
 
 所有通用的 RLT 在线训练逻辑（EnvDriver、ReplayClient、ActorClient、
@@ -1230,7 +1230,6 @@ class DobotUMIRobotBridge:
         return {
             "state": state7,
             "images": {
-                "cam_top": images["cam_front"],
                 "cam_front": images["cam_front"],
                 "cam_wrist": images["cam_wrist"],
             },

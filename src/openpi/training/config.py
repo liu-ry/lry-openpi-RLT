@@ -446,7 +446,7 @@ class LeRobotViTaiDataConfig(DataConfigFactory):
                     {
                         # 新数据集图像 key 映射 (dataset_key → internal_key)
                         "images": {
-                            "cam_top":       "observation.images.cam_top",
+                            "cam_front":     "observation.images.cam_front",
                             "cam_wrist":     "observation.images.cam_wrist",
                             "tactile_left":  "observation.images.tactile_left",
                             "tactile_right": "observation.images.tactile_right",
@@ -1167,24 +1167,24 @@ _CONFIGS = [
     # Fine-tuning ViTai configs.
     #
     TrainConfig(
-        name="pi05_vitai_lora_finetune",
+        name="pi05_vitai_lora_finetune_0604",
         model=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotViTaiDataConfig(
-            repo_id="/liury/src/lry-openpi-RLT/data/sync/converted",
+            repo_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604",
             assets=AssetsConfig(
-                asset_id="/liury/src/lry-openpi-RLT/data/sync/converted/assets",
+                asset_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604/assets",
             ),
-            default_prompt="pick and place",
+            default_prompt="pull out the peg and insert it into the hole",
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
                         {
                             "images": {
-                                "cam_top":   "observation.images.cam_top",
+                                "cam_front": "observation.images.cam_front",
                                 "cam_wrist": "observation.images.cam_wrist",
                             },
                             "state":   "observation.state",
@@ -1197,13 +1197,13 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
-        num_train_steps=1000,
-        batch_size=8,
+        num_train_steps=100_000,
+        batch_size=16,
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
-        keep_period=2,
+        keep_period=5000,
         wandb_enabled=False,
         num_workers=4,
     ),
@@ -1215,24 +1215,24 @@ _CONFIGS = [
     # 使用前将 weight_loader 路径中的 STEP 换成实际训练步数，例如：
     #   ./checkpoints/pi05_vitai_low_mem_finetune/vitai_lora_exp1/100000/params
     TrainConfig(
-        name="rlt_pi05_vitai_lora",
+        name="rlt_pi05_vitai_lora_0604",
         model=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotViTaiDataConfig(
-            repo_id="/liury/src/lry-openpi-RLT/data/sync/converted",
+            repo_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604",
             assets=AssetsConfig(
-                asset_id="/liury/src/lry-openpi-RLT/data/sync/converted/assets",
+                asset_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604/assets",
             ),
-            default_prompt="pick and place",
+            default_prompt="pull out the peg and insert it into the hole",
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
                         {
                             "images": {
-                                "cam_top":   "observation.images.cam_top",
+                                "cam_front": "observation.images.cam_front",
                                 "cam_wrist": "observation.images.cam_wrist",
                             },
                             "state":   "observation.state",
@@ -1246,11 +1246,11 @@ _CONFIGS = [
         ),
         # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/liury/src/lry-openpi-RLT/checkpoints/pi05_vitai_lora_finetune/pi05_vitai_lora_finetune_1/999/params"
+            "/liury/src/lry-openpi-RLT/checkpoints/pi05_vitai_lora_finetune_0526/pi05_vitai_lora_finetune_0526_1/68000/params"
         ),
-        num_train_steps=1_000,
+        num_train_steps=50_000,
         batch_size=8,
-        keep_period=5000,
+        keep_period=2000,
         wandb_enabled=False,
         # Stage1：VLA 完全冻结，只训练 rlt_module
         rlt_alpha=0.0,

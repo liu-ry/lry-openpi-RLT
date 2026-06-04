@@ -384,10 +384,10 @@ def main(args: Args) -> None:
 
     # Test single inference
     logging.info("Testing single inference...")
-    # Use data-level keys that vitai_policy.infer() expects (cam_top, cam_wrist)
+    # Use data-level keys that vitai_policy.infer() expects (cam_front, cam_wrist)
     fake_dict = {
         "images": {
-            "cam_top":   np.zeros((224, 224, 3), dtype=np.uint8),
+            "cam_front": np.zeros((224, 224, 3), dtype=np.uint8),
             "cam_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
         },
         "state": np.zeros(PROPRIO_DIM, dtype=np.float32),

@@ -51,10 +51,9 @@ class ViTaiInputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         state = transforms.pad_to_dim(data["state"], self.action_dim)
         
-        # Parse base camera images
-        # 新数据集 key: cam_top (俯视), cam_wrist (腕部)
+        # Parse base camera images.
         images = {
-            "base_0_rgb":       _parse_image(data["images"]["cam_top"]),
+            "base_0_rgb":       _parse_image(data["images"]["cam_front"]),
             "left_wrist_0_rgb": _parse_image(data["images"]["cam_wrist"]),
         }
         
