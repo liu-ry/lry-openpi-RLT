@@ -85,8 +85,8 @@ runtime:
   env_driver:
     # ── Machine A（Pi0 策略服务器）WebSocket 地址 ────────────────────────────
     # 修改为实际策略服务器 IP
-    machine_a_ws_url: ws://127.0.0.1:8000
-    # machine_a_ws_url: ws://192.168.3.5:8099
+    # machine_a_ws_url: ws://127.0.0.1:8000
+    machine_a_ws_url: ws://192.168.3.5:8099
     actor_service_url: http://127.0.0.1:9101
     replay_service_url: http://127.0.0.1:9102
 

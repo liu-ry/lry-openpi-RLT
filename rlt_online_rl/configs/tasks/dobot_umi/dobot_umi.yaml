@@ -26,7 +26,7 @@ experiment:
     target_tau: 0.005
     actor_update_period: 2
 
-    warmup_min_size: 600
+    warmup_min_size: 6000
     warmup_post_collect_updates: 20000
     freeze_after_warmup: false
     grad_updates_per_cycle: 5

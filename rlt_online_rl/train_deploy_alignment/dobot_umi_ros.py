@@ -258,6 +258,20 @@ DEFAULT_UMI_ENCODER_TOPIC      = "/umi1/vitai/encoder_state" # UMI 手柄夹爪�
 GRIPPER_MAX_M = 0.085
 
 
+def _gripper_travel_to_m(value: float, *, max_gripper_m: float = GRIPPER_MAX_M) -> float:
+    """Convert model/replay gripper travel units to physical opening in meters."""
+    travel = float(np.clip(value, 0.0, DEFAULT_GRIPPER_POS_CLOSE))
+    ratio_closed = travel / max(float(DEFAULT_GRIPPER_POS_CLOSE), 1.0)
+    return float(np.clip((1.0 - ratio_closed) * max_gripper_m, 0.0, max_gripper_m))
+
+
+def _gripper_m_to_travel(value: float, *, max_gripper_m: float = GRIPPER_MAX_M) -> float:
+    """Convert physical opening in meters to model/replay gripper travel units."""
+    opening_m = float(np.clip(value, 0.0, max_gripper_m))
+    ratio_closed = 1.0 - opening_m / max(float(max_gripper_m), 1e-6)
+    return float(np.clip(ratio_closed * DEFAULT_GRIPPER_POS_CLOSE, 0.0, DEFAULT_GRIPPER_POS_CLOSE))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 两路相机观测缓冲节点（ROS 话题；关节角由 SDK 直接读取）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -777,15 +791,15 @@ class UMIPoseRecorder(Node):
 
     输出格式与 PikaChunkEnvAdapter / machine_A 侧一致：
         snapshot_latest() → (np.ndarray shape (7,), seq_id)
-        其中 7D = [j1..j6 rad, gripper_m]（关节角 + 夹爪开合量）
+        其中 7D = [j1..j6 rad, gripper_travel]（关节角 + 夹爪行程值）
 
     控制链路：
         snapshot_latest() 的关节角结果通过 DobotUMIEnvAdapter._sample_latest_human_action()
         送入 send_action(_source="teleop")，再由 DobotSDKArm.servo_j() 驱动机械臂。
 
     夹爪处理：
-        夹爪当前位置由 gripper.get_position_m() 实时读取，
-        在人工接管阶段夹爪位置直接透传到输出动作（即夹爪由人工物理操控）。
+        夹爪当前位置由 gripper.get_position_m() 实时读取后转换成行程值，
+        在人工接管阶段按模型/回放使用的 gripper_travel 表示输出。
     """
 
     def __init__(
@@ -1006,7 +1020,7 @@ class UMIPoseRecorder(Node):
     def snapshot_latest(self) -> tuple[np.ndarray | None, int]:
         """返回 (7D 动作, seq_id)。
 
-        7D = [j1..j6 rad, gripper_m]（关节角 + 夹爪，与 machine_A 侧格式一致）。
+        7D = [j1..j6 rad, gripper_travel]（关节角 + 夹爪行程值，与 machine_A 侧格式一致）。
 
         增量映射得到目标末端位姿 T_ee_target，调用 Dobot SDK InverseKin 得到关节角；
         IK 失败时保持上一次输出；尚未对齐（'t' 未按）时原地保持当前关节角。
@@ -1018,13 +1032,14 @@ class UMIPoseRecorder(Node):
             T_ee_ref   = self._T_ee_ref
             q_ref      = self._q_ref
 
-        # 夹爪开合量：_on_encoder_state 已直接驱动物理夹爪，
-        # 此处直接读取物理夹爪当前实际位置，作为 action 的真实记录值。
+        # 夹爪开合量：_on_encoder_state 已直接驱动物理夹爪。
+        # 此处读取物理夹爪位置并转换为专家数据/模型使用的行程值，作为 action 的记录值。
         gripper_m = float(np.clip(self._gripper.get_position_m(), 0.0, self._max_gripper_m))
+        gripper_travel = _gripper_m_to_travel(gripper_m, max_gripper_m=self._max_gripper_m)
 
         def _hold_current() -> np.ndarray:
             q = self._arm.get_joint_angles_rad()
-            return np.concatenate([q, [gripper_m]], dtype=np.float32)
+            return np.concatenate([q, [gripper_travel]], dtype=np.float32)
 
         if T_umi_curr is None:
             logger.warning("[snapshot_latest] smooth_T is None → hold current (UMI 话题未收到数据?)")
@@ -1081,7 +1096,7 @@ class UMIPoseRecorder(Node):
             return _hold_current(), seq
 
         logger.warning("[snapshot_latest] IK 成功: q_target_deg=%s", np.round(np.rad2deg(q_target), 2).tolist())
-        action = np.concatenate([q_target, [gripper_m]], dtype=np.float32)
+        action = np.concatenate([q_target, [gripper_travel]], dtype=np.float32)
         with self._lock:
             self._last_output = action.copy()
         return action, seq
@@ -1150,6 +1165,14 @@ class DobotUMIRobotBridge:
     DEFAULT_TELEOP_MAX_DELTA_RAD: float = 0.05
     # teleop 夹爪每步最大变化量（米）
     DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M: float = 0.085  # 不限幅，允许全行程一步到位
+    # policy 每步各关节最大允许变化量（弧度）。
+    # 比 teleop 更保守，用于抑制 ref_chunk / actor 推理异常时的单步突跳。
+    DEFAULT_POLICY_MAX_DELTA_RAD: float = 0.03
+    # policy 夹爪每步最大变化量（米）
+    DEFAULT_POLICY_MAX_DELTA_GRIPPER_M: float = 0.01
+    # rollout 层统一动作增量限幅默认值（6 关节 + 夹爪）。
+    # 作为 robot bridge 关节增量限幅之前的第一道保险。
+    DEFAULT_ACTION_DELTA_LIMITS: tuple[float, ...] = (0.02, 0.02, 0.02, 0.03, 0.03, 0.03, 0.005)
 
     def __init__(
         self,
@@ -1167,6 +1190,7 @@ class DobotUMIRobotBridge:
         self._last_sent_gripper_m: float | None = None
         # EMA 平滑缓冲（用于抑制 ServoJ 微抖）
         self._ema_q6: np.ndarray | None = None
+        self._last_ema_source: str | None = None
 
     def shutdown(self) -> None:
         # 注意：不调用 disable()，不发 DisableRobot 指令。
@@ -1196,14 +1220,16 @@ class DobotUMIRobotBridge:
         if images is None:
             raise RuntimeError("采集观测失败：RealSense 相机未就绪，超过重试次数")
 
-        # 关节角通过 SDK 反馈线程直接读取（与 machine_A 侧数据格式一致）
+        # 关节角通过 SDK 反馈线程直接读取；夹爪转换为专家数据/模型使用的行程值。
         q6 = self._arm.get_joint_angles_rad()
         gripper_m = float(np.clip(self._gripper.get_position_m(), 0.0, self._args.max_gripper_m))
-        state7 = np.concatenate([q6, [gripper_m]], dtype=np.float32)
+        gripper_travel = _gripper_m_to_travel(gripper_m, max_gripper_m=self._args.max_gripper_m)
+        state7 = np.concatenate([q6, [gripper_travel]], dtype=np.float32)
 
         return {
             "state": state7,
             "images": {
+                "cam_top": images["cam_front"],
                 "cam_front": images["cam_front"],
                 "cam_wrist": images["cam_wrist"],
             },
@@ -1213,93 +1239,131 @@ class DobotUMIRobotBridge:
     def send_action(self, action7: np.ndarray, *, _source: str = "policy") -> np.ndarray:
         """执行 7D 动作。
 
-        action7 格式：[j1..j6 rad, gripper_m]（关节角 + 夹爪，与 replay buffer 记录格式一致）。
+        action7 格式：[j1..j6 rad, gripper_travel]（关节角 + 夹爪行程值，与 replay buffer 记录格式一致）。
         teleop / policy 均通过 servo_j 下发关节角。
 
-        安全限幅（teleop 路径）：
-            每步各关节目标变化量被截断到 ±teleop_max_delta_rad，
-            夹爪变化量被截断到 ±teleop_max_delta_gripper_m。
-            首步以当前实测关节角为基准，避免对齐瞬间的跳变。
+        安全限幅：
+            - policy 路径：每步关节/夹爪增量受限，抑制 ref_chunk 或 actor 推理异常时的大步跳变。
+            - teleop 路径：同样逐步限幅，避免 UMI 对齐或操作者快速抖动造成的突跳。
+            - 首步统一以当前实测关节角为基准，避免刚接管时的瞬间大幅移动。
         """
         action7 = np.asarray(action7, dtype=np.float32).reshape(-1)
         if action7.shape[0] < 7:
             raise ValueError(f"动作维度不足 7，当前 {action7.shape}")
 
         q6_desired = action7[:6]
-        gripper_m_desired = float(np.clip(action7[6], 0.0, self._args.max_gripper_m))
+        gripper_travel_desired = float(np.clip(action7[6], 0.0, DEFAULT_GRIPPER_POS_CLOSE))
+        gripper_m_desired = _gripper_travel_to_m(
+            gripper_travel_desired,
+            max_gripper_m=self._args.max_gripper_m,
+        )
+        if _source == "policy":
+            max_dq = float(
+                getattr(
+                    self._args,
+                    "policy_max_delta_rad",
+                    DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_RAD,
+                )
+            )
+            max_dg = float(
+                getattr(
+                    self._args,
+                    "policy_max_delta_gripper_m",
+                    DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_GRIPPER_M,
+                )
+            )
+        else:
+            max_dq = float(
+                getattr(
+                    self._args,
+                    "teleop_max_delta_rad",
+                    DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_RAD,
+                )
+            )
+            max_dg = float(
+                getattr(
+                    self._args,
+                    "teleop_max_delta_gripper_m",
+                    DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M,
+                )
+            )
 
         if _source == "policy":
-            # ══ [DEBUG] 策略动作暂时屏蔽，仅打印，不发送给机械臂 ══
-            # 原因：当前模型权重随机，轨迹乱动，暂不驱动真实硬件。
-            # 恢复时取消注释下方两行。
-            logger.debug(
-                "[DRY-RUN|policy] joints_deg=%s  gripper_mm=%.1f",
-                np.round(np.rad2deg(q6_desired), 2).tolist(),
-                gripper_m_desired * 1000,
-            )
-            # self._arm.servo_j(q6_desired, t=0.1)
-            # self._gripper.set_opening_m(gripper_m_desired)
-            return np.concatenate([q6_desired.astype(np.float32, copy=False), np.asarray([gripper_m_desired], dtype=np.float32)])
+            ema_alpha = float(getattr(self._args, "policy_ema_alpha", 0.35))
         else:
-            # ── 人工接管（UMI teleop）：逐步限幅后 servo_j 下发 ──
-            max_dq = float(getattr(self._args, "teleop_max_delta_rad",
-                                   DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_RAD))
-            max_dg = float(getattr(self._args, "teleop_max_delta_gripper_m",
-                                   DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M))
+            ema_alpha = float(getattr(self._args, "teleop_ema_alpha", 0.5))
 
-            # 首步：以实测关节角为基准，防止对齐瞬间大幅跳变
-            if self._last_sent_q6 is None:
-                self._last_sent_q6 = self._arm.get_joint_angles_rad().copy()
-            if self._last_sent_gripper_m is None:
-                self._last_sent_gripper_m = float(
-                    np.clip(self._gripper.get_position_m(), 0.0, self._args.max_gripper_m)
-                )
+        q6, gripper_m, clipped = self._limit_action_step(
+            q6_desired=q6_desired,
+            gripper_m_desired=gripper_m_desired,
+            max_dq=max_dq,
+            max_dg=max_dg,
+        )
+        q6_sent = self._apply_ema_and_send(q6, gripper_m, alpha=ema_alpha, source=_source)
+        gripper_travel_sent = _gripper_m_to_travel(gripper_m, max_gripper_m=self._args.max_gripper_m)
+        logger.warning(
+            "[EXEC|%s%s] joints_deg=%s  gripper_travel=%.1f  gripper_mm=%.1f",
+            _source,
+            " CLIPPED" if clipped else "        ",
+            np.round(np.rad2deg(q6_sent), 2).tolist(),
+            gripper_travel_sent,
+            gripper_m * 1000,
+        )
+        return np.concatenate(
+            [q6_sent.astype(np.float32, copy=False), np.asarray([gripper_travel_sent], dtype=np.float32)]
+        )
 
-            # 关节增量限幅
-            delta_q = q6_desired - self._last_sent_q6
-            delta_q_clipped = np.clip(delta_q, -max_dq, max_dq)
-            q6 = self._last_sent_q6 + delta_q_clipped
-
-            # 夹爪增量限幅
-            delta_g = gripper_m_desired - self._last_sent_gripper_m
-            delta_g_clipped = float(np.clip(delta_g, -max_dg, max_dg))
-            gripper_m = float(np.clip(self._last_sent_gripper_m + delta_g_clipped,
-                                      0.0, self._args.max_gripper_m))
-
-            # 记录实际发送值（下一步限幅基准）
-            self._last_sent_q6 = q6.copy()
-            self._last_sent_gripper_m = gripper_m
-
-            clipped = (np.any(np.abs(delta_q - delta_q_clipped) > 1e-6)
-                       or abs(delta_g - delta_g_clipped) > 1e-6)
-            logger.warning(
-                "[EXEC|teleop%s] joints_deg=%s  gripper_mm=%.1f",
-                " CLIPPED" if clipped else "        ",
-                np.round(np.rad2deg(q6), 2).tolist(),
-                gripper_m * 1000,
+    def _limit_action_step(
+        self,
+        *,
+        q6_desired: np.ndarray,
+        gripper_m_desired: float,
+        max_dq: float,
+        max_dg: float,
+    ) -> tuple[np.ndarray, float, bool]:
+        if self._last_sent_q6 is None:
+            self._last_sent_q6 = self._arm.get_joint_angles_rad().copy()
+        if self._last_sent_gripper_m is None:
+            self._last_sent_gripper_m = float(
+                np.clip(self._gripper.get_position_m(), 0.0, self._args.max_gripper_m)
             )
-            # ServoJ 平滑：EMA 滤波抑制微抖
-            # alpha 越大响应越快，越小越平滑。默认 0.5（可由 args.teleop_ema_alpha 覆盖）
-            alpha = float(getattr(self._args, "teleop_ema_alpha", 0.5))
-            if self._ema_q6 is None:
-                self._ema_q6 = q6.copy()
-            else:
-                self._ema_q6 = alpha * q6 + (1.0 - alpha) * self._ema_q6
-            # ServoJ 的 t 使用 0.1s（Dobot 文档推荐默认值，对指令到达时间抖动最宽容）
-            # aheadtime 必须严格 < t*1000ms，取 20ms（远小于 100ms）以避免边界不稳定
-            control_hz = float(getattr(self._args, "control_frequency_hz", 20.0))
-            servo_t = max(0.1, 1.0 / control_hz)
-            self._arm.servo_j(self._ema_q6, t=servo_t)
-            self._gripper.set_opening_m(gripper_m)
-            return np.concatenate(
-                [self._ema_q6.astype(np.float32, copy=False), np.asarray([gripper_m], dtype=np.float32)]
-            )
+
+        delta_q = q6_desired - self._last_sent_q6
+        delta_q_clipped = np.clip(delta_q, -max_dq, max_dq)
+        q6 = self._last_sent_q6 + delta_q_clipped
+
+        delta_g = gripper_m_desired - self._last_sent_gripper_m
+        delta_g_clipped = float(np.clip(delta_g, -max_dg, max_dg))
+        gripper_m = float(
+            np.clip(self._last_sent_gripper_m + delta_g_clipped, 0.0, self._args.max_gripper_m)
+        )
+
+        self._last_sent_q6 = q6.copy()
+        self._last_sent_gripper_m = gripper_m
+        clipped = bool(
+            np.any(np.abs(delta_q - delta_q_clipped) > 1e-6)
+            or abs(delta_g - delta_g_clipped) > 1e-6
+        )
+        return q6, gripper_m, clipped
+
+    def _apply_ema_and_send(self, q6: np.ndarray, gripper_m: float, *, alpha: float, source: str) -> np.ndarray:
+        if self._ema_q6 is None or self._last_ema_source != source:
+            self._ema_q6 = q6.copy()
+        else:
+            self._ema_q6 = alpha * q6 + (1.0 - alpha) * self._ema_q6
+        self._last_ema_source = source
+        control_hz = float(getattr(self._args, "control_frequency_hz", 20.0))
+        servo_t = max(0.1, 1.0 / control_hz)
+        self._arm.servo_j(self._ema_q6, t=servo_t)
+        self._gripper.set_opening_m(gripper_m)
+        return self._ema_q6.copy()
 
     def reset_teleop_state(self) -> None:
         """每次切换到 teleop 模式前调用，清除上次发送记录，强制首步以实测为基准。"""
         self._last_sent_q6 = None
         self._last_sent_gripper_m = None
         self._ema_q6 = None  # 清空 EMA 缓冲，避免上次遥操作状态污染新一轮
+        self._last_ema_source = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1316,11 +1380,46 @@ class DobotUMIEnvAdapter(PikaChunkEnvAdapter):
     本子类仅覆盖 _sample_latest_human_action：在返回动作之前，
     同时将该动作以 _source="teleop" 发给机械臂，触发实际运动。
 
-    DEBUG 模式（策略屏蔽）：
+    当前行为：
         _sample_latest_human_action 正常执行 → 机械臂跟随 UMI 运动。
         execute_chunk 中策略分支的 robot.send_action(bounded) 调用 DobotUMIRobotBridge
-        的 send_action(_source="policy")，该路径已被 dry-run（只打印，不发送）。
+        的 send_action(_source="policy")，该路径会经过逐步限幅后真实发送。
     """
+
+    def _apply_action_limits(self, action: np.ndarray) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float32).reshape(-1)[: self._system.rl.action_dim]
+        if self._action_delta_limits is None or self._last_sent_action is None:
+            self._last_sent_action = action.copy()
+            return action
+
+        prev = self._last_sent_action.copy()
+        current_for_limit = action.copy()
+        prev_for_limit = prev.copy()
+        if action.shape[0] >= 7:
+            current_for_limit[6] = _gripper_travel_to_m(
+                float(action[6]),
+                max_gripper_m=self._robot._args.max_gripper_m,
+            )
+            prev_for_limit[6] = _gripper_travel_to_m(
+                float(prev[6]),
+                max_gripper_m=self._robot._args.max_gripper_m,
+            )
+
+        delta = np.clip(
+            current_for_limit - prev_for_limit,
+            -self._action_delta_limits,
+            self._action_delta_limits,
+        )
+        bounded_for_limit = prev_for_limit + delta
+        bounded = action.copy()
+        bounded[: bounded_for_limit.shape[0]] = bounded_for_limit
+        if bounded.shape[0] >= 7:
+            bounded[6] = _gripper_m_to_travel(
+                float(bounded_for_limit[6]),
+                max_gripper_m=self._robot._args.max_gripper_m,
+            )
+        self._last_sent_action = bounded.copy()
+        return bounded
 
     def _sample_latest_human_action(self, observation) -> np.ndarray:
         logger.warning("[DobotUMIEnvAdapter] _sample_latest_human_action 被调用")
@@ -1428,8 +1527,8 @@ def parse_args() -> argparse.Namespace:
         "--action_delta_limits",
         type=float,
         nargs=7,
-        default=None,
-        help="7D 各维度动作增量上限裁切（6 关节 + 夹爪）",
+        default=DobotUMIRobotBridge.DEFAULT_ACTION_DELTA_LIMITS,
+        help="7D 各维度动作增量上限裁切（6 关节 + 夹爪）。默认启用保守真机安全值。",
     )
 
     # ── 图像 ──────────────────────────────────────────────────────────────────
@@ -1492,6 +1591,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M,
         help="teleop 每步夹爪最大变化量（米）。默认 0.005 m/step。",
+    )
+    parser.add_argument(
+        "--teleop_ema_alpha",
+        type=float,
+        default=0.5,
+        help="teleop 路径 ServoJ EMA 平滑系数。默认 0.5，越小越平滑，越大响应越快。",
+    )
+    parser.add_argument(
+        "--policy_max_delta_rad",
+        type=float,
+        default=DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_RAD,
+        help="policy 每步每关节最大变化量（弧度）。默认 0.03 rad ≈ 1.7°/step，用于限制 ref_chunk/actor 异常突跳。",
+    )
+    parser.add_argument(
+        "--policy_max_delta_gripper_m",
+        type=float,
+        default=DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_GRIPPER_M,
+        help="policy 每步夹爪最大变化量（米）。默认 0.01 m/step。",
+    )
+    parser.add_argument(
+        "--policy_ema_alpha",
+        type=float,
+        default=0.35,
+        help="policy 路径 ServoJ EMA 平滑系数。默认 0.35，比 teleop 更保守。",
     )
 
     # ── 训练控制 ─────────────────────────────────────────────────────────────

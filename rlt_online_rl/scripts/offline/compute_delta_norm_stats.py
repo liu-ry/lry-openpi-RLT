@@ -1,7 +1,7 @@
 """Compute delta-action quantile norm stats from a LeRobot dataset.
 
-Reads all parquet episode files, computes per-step delta actions
-(action[t] - state[t], joints 0-5; joint 6 gripper kept as-is),
+Reads all parquet episode files, computes chunk-aware delta actions
+(action[t:t+chunk_len] - state[t], joints 0-5; joint 6 gripper kept as-is),
 then saves q01/q99 for both delta_actions and state to a JSON file
 compatible with ActionRepresentationAdapter.
 
@@ -9,14 +9,14 @@ Usage:
     python scripts/offline/compute_delta_norm_stats.py \
         --dataset-dir /home/lry/temp/sync/converted \
         --output-path configs/tasks/dobot_umi/stats/norm_stats_delta.json \
-        [--action-dim 7] [--proprio-dim 7] [--q-low 0.01] [--q-high 0.99]
+        [--action-dim 7] [--proprio-dim 7] [--chunk-len 50] \
+        [--q-low 0.01] [--q-high 0.99]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -55,18 +55,35 @@ def load_lerobot_episodes(dataset_dir: Path) -> tuple[list[np.ndarray], list[np.
     return all_actions, all_states
 
 
-def compute_delta_actions(
+def compute_delta_action_windows(
     actions: np.ndarray,
     states: np.ndarray,
     *,
     action_dim: int = 7,
-) -> np.ndarray:
-    """Compute per-step delta: action[:6] - state[:6], action[6] kept absolute."""
+    proprio_dim: int = 7,
+    chunk_len: int = 50,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute sliding-window deltas anchored at each window's start state."""
     assert actions.shape[0] == states.shape[0], "Mismatch in time axis"
+    if chunk_len <= 0:
+        raise ValueError(f"chunk_len must be positive, got {chunk_len}")
+    if actions.shape[0] < chunk_len:
+        return (
+            np.empty((0, chunk_len, action_dim), dtype=np.float32),
+            np.empty((0, proprio_dim), dtype=np.float32),
+        )
+
     n_joints = min(6, action_dim - 1)  # joints 0..5 are position, joint 6 is gripper
-    delta = actions.copy()
-    delta[:, :n_joints] = actions[:, :n_joints] - states[:, :n_joints]
-    return delta
+    num_windows = actions.shape[0] - chunk_len + 1
+    delta_windows = np.empty((num_windows, chunk_len, action_dim), dtype=np.float32)
+    state0 = states[:num_windows, :proprio_dim].astype(np.float32, copy=False)
+
+    for start in range(num_windows):
+        chunk = actions[start : start + chunk_len, :action_dim].astype(np.float32, copy=True)
+        chunk[:, :n_joints] -= state0[start, :n_joints]
+        delta_windows[start] = chunk
+
+    return delta_windows, state0
 
 
 def main() -> None:
@@ -78,6 +95,7 @@ def main() -> None:
     )
     parser.add_argument("--action-dim", type=int, default=7)
     parser.add_argument("--proprio-dim", type=int, default=7)
+    parser.add_argument("--chunk-len", type=int, default=50, help="Sliding window length (default: 50)")
     parser.add_argument("--q-low", type=float, default=0.01, help="Lower quantile (default: 0.01)")
     parser.add_argument("--q-high", type=float, default=0.99, help="Upper quantile (default: 0.99)")
     args = parser.parse_args()
@@ -85,20 +103,34 @@ def main() -> None:
     print(f"Loading LeRobot dataset from {args.dataset_dir} ...")
     all_actions_eps, all_states_eps = load_lerobot_episodes(args.dataset_dir)
 
-    print("Computing delta actions ...")
+    print(f"Computing chunk-aware delta actions (chunk_len={args.chunk_len}) ...")
     delta_chunks: list[np.ndarray] = []
     state_chunks: list[np.ndarray] = []
     for actions_ep, states_ep in zip(all_actions_eps, all_states_eps):
         a = actions_ep[:, : args.action_dim]
         s = states_ep[:, : args.proprio_dim]
-        d = compute_delta_actions(a, s, action_dim=args.action_dim)
+        d, state0 = compute_delta_action_windows(
+            a,
+            s,
+            action_dim=args.action_dim,
+            proprio_dim=args.proprio_dim,
+            chunk_len=args.chunk_len,
+        )
+        if d.shape[0] == 0:
+            print(f"  Skipped short episode: {a.shape[0]} steps < chunk_len {args.chunk_len}")
+            continue
         delta_chunks.append(d)
-        state_chunks.append(s)
+        state_chunks.append(state0)
 
-    all_deltas = np.concatenate(delta_chunks, axis=0)   # (N, action_dim)
-    all_states = np.concatenate(state_chunks, axis=0)   # (N, proprio_dim)
+    if not delta_chunks:
+        raise ValueError(f"No complete windows found. Check dataset length and chunk_len={args.chunk_len}.")
 
-    print(f"Total steps: {all_deltas.shape[0]}")
+    all_delta_windows = np.concatenate(delta_chunks, axis=0)  # (W, chunk_len, action_dim)
+    all_deltas = all_delta_windows.reshape(-1, args.action_dim)  # (W * chunk_len, action_dim)
+    all_states = np.concatenate(state_chunks, axis=0)  # (W, proprio_dim)
+
+    print(f"Total windows: {all_delta_windows.shape[0]}")
+    print(f"Total delta samples: {all_deltas.shape[0]}")
     print(f"Delta action stats (before clipping):")
     print(f"  min  : {all_deltas.min(axis=0)}")
     print(f"  max  : {all_deltas.max(axis=0)}")
