@@ -7,6 +7,7 @@ import tty
 import rclpy
 from rclpy.node import Node
 from std_srvs.srv import Trigger
+from train_deploy_alignment.manual_signal_bridge import APPROVE_ONLINE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import ENTER_CRITICAL_PHASE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_FAILURE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_SUCCESS_SERVICE
@@ -55,6 +56,7 @@ class KeyboardTeleopRecordRewardToggle(Node):
         self.success_cli = self.create_client(Trigger, RECORD_SUCCESS_SERVICE)
         self.failure_cli = self.create_client(Trigger, RECORD_FAILURE_SERVICE)
         self.critical_phase_cli = self.create_client(Trigger, ENTER_CRITICAL_PHASE_SERVICE)
+        self.online_approval_cli = self.create_client(Trigger, APPROVE_ONLINE_SERVICE)
         self.control_mode = "unknown"
 
         self.get_logger().info(f"Waiting for local teleop service {rl_service}...")
@@ -70,6 +72,7 @@ class KeyboardTeleopRecordRewardToggle(Node):
         self.success_cli.wait_for_service()
         self.failure_cli.wait_for_service()
         self.critical_phase_cli.wait_for_service()
+        self.online_approval_cli.wait_for_service()
 
         self.refresh_teleop_mode(retries=5, timeout_sec=1.5)
         self.get_logger().info(self._ready_message())
@@ -78,7 +81,7 @@ class KeyboardTeleopRecordRewardToggle(Node):
         return (
             "Ready. Press 't' to toggle teleop. Press 'o' to start the next episode. "
             "Press 's' to end the episode with success. Press 'f' to end the episode with failure. "
-            "Press 'c' to enter the critical phase. Press 'q' to quit."
+            "Press 'c' to enter the critical phase. Press Enter to approve warmup->RL switch. Press 'q' to quit."
         )
 
     @staticmethod
@@ -248,6 +251,15 @@ class KeyboardTeleopRecordRewardToggle(Node):
             return
         self.get_logger().warn(resp.message if resp.message else "Entering the critical phase failed.")
 
+    def approve_online_transition(self):
+        resp = self._call_trigger(self.online_approval_cli, "Failed to approve online transition.")
+        if resp is None:
+            return
+        if resp.success:
+            self.get_logger().info(resp.message if resp.message else "Approved online transition.")
+            return
+        self.get_logger().warn(resp.message if resp.message else "Approving online transition failed.")
+
 
 def main():
     cli = _parse_cli_args()
@@ -272,6 +284,8 @@ def main():
                 node.record_failure()
             elif ch == "c":
                 node.enter_critical_phase()
+            elif ch in ("\r", "\n"):
+                node.approve_online_transition()
     except KeyboardInterrupt:
         pass
     finally:

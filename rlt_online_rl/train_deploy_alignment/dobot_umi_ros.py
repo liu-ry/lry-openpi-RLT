@@ -504,8 +504,9 @@ class DobotSDKArm:
         if not self._connected:
             return False
         jd = np.rad2deg(np.asarray(joints_rad, dtype=np.float64).reshape(-1)[:6])
-        # aheadtime 必须严格 < t*1000ms；取 t*400（即 40% 周期），最大不超过 40ms
-        aheadtime = min(t * 400.0, 40.0)
+        # Dobot SDK 文档给出的典型范围是 aheadtime in [20, 100]。
+        # 这里随控制周期自适应，并限制在保守范围内。
+        aheadtime = float(np.clip(t * 1000.0 * 0.4, 20.0, 40.0))
         resp = self._dashboard.ServoJ(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5], t, aheadtime, 500.0)
         return _parse_dobot_resp(resp)[0] == 0
 
@@ -1301,14 +1302,17 @@ class DobotUMIRobotBridge:
         )
         q6_sent = self._apply_ema_and_send(q6, gripper_m, alpha=ema_alpha, source=_source)
         gripper_travel_sent = _gripper_m_to_travel(gripper_m, max_gripper_m=self._args.max_gripper_m)
-        logger.warning(
-            "[EXEC|%s%s] joints_deg=%s  gripper_travel=%.1f  gripper_mm=%.1f",
-            _source,
-            " CLIPPED" if clipped else "        ",
-            np.round(np.rad2deg(q6_sent), 2).tolist(),
-            gripper_travel_sent,
-            gripper_m * 1000,
-        )
+        if clipped:
+            logger.warning(
+                "[EXEC|%s CLIPPED] desired_deg=%s limited_deg=%s sent_deg=%s desired_gripper=%.1f limited_gripper=%.1f gripper_mm=%.1f",
+                _source,
+                np.round(np.rad2deg(q6_desired), 2).tolist(),
+                np.round(np.rad2deg(q6), 2).tolist(),
+                np.round(np.rad2deg(q6_sent), 2).tolist(),
+                gripper_travel_desired,
+                gripper_travel_sent,
+                gripper_m * 1000,
+            )
         return np.concatenate(
             [q6_sent.astype(np.float32, copy=False), np.asarray([gripper_travel_sent], dtype=np.float32)]
         )
@@ -1353,13 +1357,14 @@ class DobotUMIRobotBridge:
             self._ema_q6 = alpha * q6 + (1.0 - alpha) * self._ema_q6
         self._last_ema_source = source
         control_hz = float(getattr(self._args, "control_frequency_hz", 20.0))
-        servo_t = max(0.1, 1.0 / control_hz)
+        # ServoJ 的 t 应与控制周期一致；SDK 文档下限约为 0.02s。
+        servo_t = max(0.02, 1.0 / control_hz)
         self._arm.servo_j(self._ema_q6, t=servo_t)
         self._gripper.set_opening_m(gripper_m)
         return self._ema_q6.copy()
 
     def reset_teleop_state(self) -> None:
-        """每次切换到 teleop 模式前调用，清除上次发送记录，强制首步以实测为基准。"""
+        """清除控制缓存，强制后续首步以当前实测状态为基准。"""
         self._last_sent_q6 = None
         self._last_sent_gripper_m = None
         self._ema_q6 = None  # 清空 EMA 缓冲，避免上次遥操作状态污染新一轮
@@ -1499,6 +1504,9 @@ class DobotUMIEnvAdapter(PikaChunkEnvAdapter):
 
         # ── 夹爪归位 ────────────────────────────────────────────────────────────
         self._robot._gripper.set_opening_m(gripper_m_target)
+        # 清掉上一回合残留的 policy/teleop 控制缓存，避免下一回合首步沿着旧末状态续跑。
+        self._robot.reset_teleop_state()
+        self._last_sent_action = None
 
         time.sleep(0.3)
 
@@ -1574,6 +1582,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teleop_trigger_service", type=str, default=DEFAULT_TELEOP_TRIGGER_SVC)
     parser.add_argument("--policy_resume_delay_s", type=float, default=1.0)
     parser.add_argument("--start_in_human_mode", action="store_true")
+    parser.add_argument(
+        "--require_online_approval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Warmup 达标后，不自动切换到 RL；必须手动批准后，下一回合才允许 online actor 控制。",
+    )
     parser.add_argument("--obs_ready_timeout_s", type=float, default=None)
     parser.add_argument("--ros_domain_id", type=int, default=9,
                         help="ROS_DOMAIN_ID（UMI 默认发布在 domain 9）")
@@ -1613,7 +1627,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policy_ema_alpha",
         type=float,
-        default=0.35,
+        default=0.8,
         help="policy 路径 ServoJ EMA 平滑系数。默认 0.35，比 teleop 更保守。",
     )
 
@@ -1767,6 +1781,7 @@ def main() -> None:
             replay_client,
             system.rl.warmup_min_size,
             min_online_actor_version=min_online_actor_version,
+            require_online_approval=args.require_online_approval,
             logger_=logger,
         )
     )
@@ -1776,6 +1791,8 @@ def main() -> None:
     )
     phase_controller.bind_actor_version_getter(base_actor_client.get_actor_param_version)
     phase_controller.bind_learner_status_getter(_make_learner_status_reader(learner_status_path))
+    phase_controller.bind_online_approval_getter(runtime_context.has_online_approval)
+    phase_controller.bind_online_approval_consumer(runtime_context.consume_online_approval)
 
     actor_client = PhaseAwareActorClient(base_actor_client, phase_controller, runtime_context)
 

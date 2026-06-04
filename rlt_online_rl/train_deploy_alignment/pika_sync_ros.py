@@ -57,6 +57,7 @@ from manual_signal_bridge import SIGNAL_MANUAL_DONE_PENDING
 from manual_signal_bridge import SIGNAL_MANUAL_FAILURE_PENDING
 from manual_signal_bridge import SIGNAL_MANUAL_SUCCESS_PENDING
 from manual_signal_bridge import SIGNAL_NEXT_EPISODE_REQUESTED
+from manual_signal_bridge import SIGNAL_ONLINE_APPROVED
 from manual_signal_bridge import SIGNAL_SELECTED_CRITICAL_POLICY
 from manual_signal_bridge import SIGNAL_TASK_MODE
 from manual_signal_bridge import TOGGLE_CRITICAL_PHASE_SERVICE
@@ -153,6 +154,7 @@ class RolloutRuntimeContext:
             self.signal_values[SIGNAL_MANUAL_SUCCESS_PENDING] = False
             self.signal_values[SIGNAL_MANUAL_FAILURE_PENDING] = False
             self.signal_values[SIGNAL_MANUAL_DONE_PENDING] = False
+            self.signal_values.setdefault(SIGNAL_ONLINE_APPROVED, False)
             self._condition.notify_all()
 
     def set_selected_critical_policy_mode(self, mode: str) -> None:
@@ -166,6 +168,19 @@ class RolloutRuntimeContext:
 
     def request_next_episode(self) -> None:
         self.set_signal(SIGNAL_NEXT_EPISODE_REQUESTED, True)
+
+    def approve_online_transition(self) -> None:
+        self.set_signal(SIGNAL_ONLINE_APPROVED, True)
+
+    def has_online_approval(self) -> bool:
+        return bool(self.get_signal(SIGNAL_ONLINE_APPROVED, False))
+
+    def consume_online_approval(self) -> bool:
+        with self._condition:
+            approved = bool(self.signal_values.get(SIGNAL_ONLINE_APPROVED, False))
+            self.signal_values[SIGNAL_ONLINE_APPROVED] = False
+            self._condition.notify_all()
+            return approved
 
     def wait_for_next_episode_request(self) -> None:
         with self._condition:
@@ -216,20 +231,25 @@ class RolloutPhaseController:
         warmup_min_size: int,
         *,
         min_online_actor_version: int,
+        require_online_approval: bool = False,
         logger_: logging.Logger,
     ):
         self._replay_client = replay_client
         self._warmup_min_size = max(int(warmup_min_size), 0)
         self._min_online_actor_version = max(int(min_online_actor_version), 0)
+        self._require_online_approval = bool(require_online_approval)
         self._logger = logger_
         self._status = "warmup_collect" if self._warmup_min_size > 0 else "online"
         self._episode_phase = "warmup" if self._warmup_min_size > 0 else "online"
         self._warmup_data_ready = self._warmup_min_size <= 0
         self._actor_version_getter: Callable[[], int] | None = None
         self._learner_status_getter: Callable[[], dict[str, Any]] | None = None
+        self._online_approval_getter: Callable[[], bool] | None = None
+        self._online_approval_consumer: Callable[[], bool] | None = None
         self._logged_initial = False
         self._last_wait_actor_version = -1
         self._last_wait_global_step = -1
+        self._last_wait_approval = None
 
     @property
     def episode_phase(self) -> str:
@@ -240,6 +260,12 @@ class RolloutPhaseController:
 
     def bind_learner_status_getter(self, getter: Callable[[], dict[str, Any]]) -> None:
         self._learner_status_getter = getter
+
+    def bind_online_approval_getter(self, getter: Callable[[], bool]) -> None:
+        self._online_approval_getter = getter
+
+    def bind_online_approval_consumer(self, consumer: Callable[[], bool]) -> None:
+        self._online_approval_consumer = consumer
 
     def begin_episode(self) -> str:
         if self._warmup_min_size <= 0:
@@ -295,14 +321,20 @@ class RolloutPhaseController:
         if not self._warmup_data_ready:
             self._status = "warmup_collect"
             return
-        if self._is_online_ready():
-            self._status = "online"
+        if self._is_actor_ready() and self._is_training_ready():
+            if self._try_enter_online():
+                self._status = "online"
+                self._logger.info(
+                    "Warmup complete; next episode will use online actor actor_version=%s required=%s learner_updates=%s/%s",
+                    self._safe_actor_version(),
+                    self._min_online_actor_version,
+                    self._learner_global_step(),
+                    self._learner_warmup_required_updates(),
+                )
+                return
+            self._status = "warmup_wait_online"
             self._logger.info(
-                "Warmup complete; next episode will use online actor actor_version=%s required=%s learner_updates=%s/%s",
-                self._safe_actor_version(),
-                self._min_online_actor_version,
-                self._learner_global_step(),
-                self._learner_warmup_required_updates(),
+                "Warmup complete; online is trained and actor-ready, waiting for manual approval before switching to RL.",
             )
             return
         self._status = "warmup_wait_online"
@@ -346,7 +378,37 @@ class RolloutPhaseController:
         return bool(self._safe_learner_status().get("ready_for_online", False))
 
     def _is_online_ready(self) -> bool:
-        return self._is_actor_ready() and self._is_training_ready()
+        return self._is_actor_ready() and self._is_training_ready() and self._has_online_approval()
+
+    def _has_online_approval(self) -> bool:
+        if not self._require_online_approval:
+            return True
+        if self._online_approval_getter is None:
+            return False
+        try:
+            return bool(self._online_approval_getter())
+        except RuntimeError:
+            return False
+
+    def _consume_online_approval(self) -> bool:
+        if not self._require_online_approval:
+            return True
+        if self._online_approval_consumer is None:
+            return False
+        try:
+            return bool(self._online_approval_consumer())
+        except RuntimeError:
+            return False
+
+    def _try_enter_online(self) -> bool:
+        if not (self._is_actor_ready() and self._is_training_ready()):
+            return False
+        if not self._has_online_approval():
+            return False
+        consumed = self._consume_online_approval()
+        if not consumed and self._require_online_approval:
+            return False
+        return True
 
     def _wait_until_online_ready(self) -> None:
         while True:
@@ -354,7 +416,12 @@ class RolloutPhaseController:
             learner_status = self._safe_learner_status()
             learner_global_step = int(learner_status.get("global_step", 0))
             warmup_required_updates = int(learner_status.get("warmup_required_updates", 0))
-            if actor_version >= self._min_online_actor_version and bool(learner_status.get("ready_for_online", False)):
+            online_approved = self._has_online_approval()
+            if (
+                actor_version >= self._min_online_actor_version
+                and bool(learner_status.get("ready_for_online", False))
+                and self._try_enter_online()
+            ):
                 self._status = "online"
                 self._logger.info(
                     "Online rollout ready actor_version=%s required=%s learner_updates=%s/%s",
@@ -364,16 +431,32 @@ class RolloutPhaseController:
                     warmup_required_updates,
                 )
                 return
-            if actor_version != self._last_wait_actor_version or learner_global_step != self._last_wait_global_step:
-                self._logger.info(
-                    "Waiting for online readiness actor_version=%s required=%s learner_updates=%s/%s",
-                    actor_version,
-                    self._min_online_actor_version,
-                    learner_global_step,
-                    warmup_required_updates,
-                )
+            if (
+                actor_version != self._last_wait_actor_version
+                or learner_global_step != self._last_wait_global_step
+                or online_approved != self._last_wait_approval
+            ):
+                if actor_version >= self._min_online_actor_version and bool(learner_status.get("ready_for_online", False)):
+                    self._logger.info(
+                        "Waiting for manual online approval actor_version=%s required=%s learner_updates=%s/%s approved=%s",
+                        actor_version,
+                        self._min_online_actor_version,
+                        learner_global_step,
+                        warmup_required_updates,
+                        online_approved,
+                    )
+                else:
+                    self._logger.info(
+                        "Waiting for online readiness actor_version=%s required=%s learner_updates=%s/%s approved=%s",
+                        actor_version,
+                        self._min_online_actor_version,
+                        learner_global_step,
+                        warmup_required_updates,
+                        online_approved,
+                    )
                 self._last_wait_actor_version = actor_version
                 self._last_wait_global_step = learner_global_step
+                self._last_wait_approval = online_approved
             time.sleep(0.25)
 
 
@@ -1121,8 +1204,12 @@ class PikaChunkEnvAdapter:
                     dtype=np.float32,
                 )[: self._system.rl.action_dim]
                 bounded = self._apply_action_limits(raw_action)
-                self._robot.send_action(bounded)
-                executed.append(bounded)
+                sent_action = self._robot.send_action(bounded)
+                if sent_action is None:
+                    executed_action = bounded
+                else:
+                    executed_action = np.asarray(sent_action, dtype=np.float32)[: self._system.rl.action_dim]
+                executed.append(executed_action)
                 ref_actions.append(
                     np.asarray(current_plan.ref_chunk[plan_cursor], dtype=np.float32)[: self._system.rl.action_dim]
                 )
@@ -1464,6 +1551,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teleop_trigger_service", type=str, default="/teleop_trigger_rl")
     parser.add_argument("--policy_resume_delay_s", type=float, default=1.0)
     parser.add_argument("--start_in_human_mode", action="store_true")
+    parser.add_argument(
+        "--require_online_approval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Warmup 达标后，不自动切换到 RL；必须收到手动批准信号后，下一回合才允许 online actor 控制。",
+    )
     parser.add_argument("--obs_ready_timeout_s", type=float, default=None)
     parser.add_argument(
         "--step_trace_stride",
@@ -1601,6 +1694,7 @@ def main() -> None:
             replay_client,
             system.rl.warmup_min_size,
             min_online_actor_version=min_online_actor_version,
+            require_online_approval=args.require_online_approval,
             logger_=logger,
         )
     )
@@ -1610,6 +1704,8 @@ def main() -> None:
     )
     phase_controller.bind_actor_version_getter(base_actor_client.get_actor_param_version)
     phase_controller.bind_learner_status_getter(_make_learner_status_reader(learner_status_path))
+    phase_controller.bind_online_approval_getter(runtime_context.has_online_approval)
+    phase_controller.bind_online_approval_consumer(runtime_context.consume_online_approval)
     actor_client = PhaseAwareActorClient(
         base_actor_client,
         phase_controller,

@@ -108,12 +108,8 @@ def main() -> None:
     actor_service_url = _peek_option(argv, "--actor_service_url") or system.env_driver.actor_service_url
     replay_service_url = _peek_option(argv, "--replay_service_url") or system.env_driver.replay_service_url
 
-    print(f"[launch_robot_rollout] ros_script={ros_script.name}", flush=True)
-    print(f"[launch_robot_rollout] waiting for actor_service at {actor_service_url}", flush=True)
     _wait_for_http(f"{actor_service_url.rstrip('/')}/version")
-    print(f"[launch_robot_rollout] waiting for replay_manager at {replay_service_url}", flush=True)
     _wait_for_http(f"{replay_service_url.rstrip('/')}/stats")
-    print(f"[launch_robot_rollout] services ready, starting {ros_script.name}.", flush=True)
 
     # ── 在 execv 前 source ROS2 工作空间，让子进程继承完整的 LD_LIBRARY_PATH ──
     # 候选顺序：仓库内自带 → 外部 handheld-umi_ws
@@ -124,7 +120,6 @@ def main() -> None:
     ]
     for _ws in _ws_candidates:
         if _apply_ros_workspace(str(_ws)):
-            print(f"[launch_robot_rollout] sourced {_ws}", flush=True)
             break
 
     os.chdir(REPO_ROOT)

@@ -17,6 +17,7 @@ ENTER_CRITICAL_PHASE_SERVICE = "/enter_critical_phase"
 TOGGLE_CRITICAL_PHASE_SERVICE = "/toggle_critical_phase"
 SET_CRITICAL_POLICY_ACTOR_SERVICE = "/select_critical_policy_actor"
 SET_CRITICAL_POLICY_BASE_SERVICE = "/select_critical_policy_base"
+APPROVE_ONLINE_SERVICE = "/approve_online_transition"
 
 SIGNAL_NEXT_EPISODE_REQUESTED = "next_episode_requested"
 SIGNAL_MANUAL_SUCCESS_PENDING = "manual_success_pending"
@@ -26,6 +27,7 @@ SIGNAL_CRITICAL_STARTED = "critical_started"
 SIGNAL_SELECTED_CRITICAL_POLICY = "selected_critical_policy"
 SIGNAL_EPISODE_CRITICAL_POLICY = "episode_critical_policy"
 SIGNAL_TASK_MODE = "task_mode"
+SIGNAL_ONLINE_APPROVED = "online_approved"
 
 
 class ManualSignalBridge:
@@ -45,6 +47,7 @@ class ManualSignalBridgeNode(Node):
         self.create_service(Trigger, TOGGLE_CRITICAL_PHASE_SERVICE, self._on_toggle_critical_phase)
         self.create_service(Trigger, SET_CRITICAL_POLICY_ACTOR_SERVICE, self._on_select_critical_policy_actor)
         self.create_service(Trigger, SET_CRITICAL_POLICY_BASE_SERVICE, self._on_select_critical_policy_base)
+        self.create_service(Trigger, APPROVE_ONLINE_SERVICE, self._on_approve_online)
         self.get_logger().info(
             "Manual signal services ready: "
             f"{REQUEST_NEXT_EPISODE_SERVICE} "
@@ -54,7 +57,8 @@ class ManualSignalBridgeNode(Node):
             f"{ENTER_CRITICAL_PHASE_SERVICE} "
             f"{TOGGLE_CRITICAL_PHASE_SERVICE} "
             f"{SET_CRITICAL_POLICY_ACTOR_SERVICE} "
-            f"{SET_CRITICAL_POLICY_BASE_SERVICE}"
+            f"{SET_CRITICAL_POLICY_BASE_SERVICE} "
+            f"{APPROVE_ONLINE_SERVICE}"
         )
 
     def _on_request_next_episode(self, _request, response):
@@ -114,4 +118,10 @@ class ManualSignalBridgeNode(Node):
         self._runtime_context.set_selected_critical_policy_mode("base")
         response.success = True
         response.message = "Selected critical policy mode=base for the next episode."
+        return response
+
+    def _on_approve_online(self, _request, response):
+        self._runtime_context.approve_online_transition()
+        response.success = True
+        response.message = "Approved online transition."
         return response
