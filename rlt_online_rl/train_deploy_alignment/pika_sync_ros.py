@@ -1250,11 +1250,11 @@ class PikaChunkEnvAdapter:
                 human_controlled.append(True)
                 step_sources.append(int(TransitionSource.HUMAN))
                 actor_param_versions.append(-1)
+            step_observations.append(self._robot.get_observation(self._resize_hw, self._task_state.get()))
             elapsed = time.perf_counter() - tick_start
             remaining = period - elapsed
             if remaining > 0:
                 time.sleep(remaining)
-            step_observations.append(self._robot.get_observation(self._resize_hw, self._task_state.get()))
 
         next_observation = (
             step_observations[-1]

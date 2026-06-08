@@ -32,10 +32,10 @@ experiment:
     actor_update_period: 2
 
     # warmup_min_size：收集到 600 条 transition 后进入在线 RL 阶段
-    warmup_min_size: 600
+    warmup_min_size: 350
     warmup_post_collect_updates: 20000
     freeze_after_warmup: false
-    grad_updates_per_cycle: 5
+    grad_updates_per_cycle: 10
 
 runtime:
   role: all
@@ -75,7 +75,7 @@ runtime:
     bind_host: 127.0.0.1
     port: 9102
     seed: 0
-    sample_strategy: uniform
+    sample_strategy: uniform  # uniform / stratified
     recent_episode_window: 20
     recent_online_ratio: 0.4
     warmup_demo_ratio: 0.3

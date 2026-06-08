@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -11,7 +12,6 @@ import flax.traverse_util as traverse_util
 import jax
 import jax.experimental
 import jax.numpy as jnp
-import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
 import wandb
@@ -194,6 +194,14 @@ def train_step(
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+
+    torchrun_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if torchrun_world_size > 1:
+        raise RuntimeError(
+            "scripts/train.py uses JAX single-process multi-device sharding and should not be launched with "
+            f"torchrun/mpirun-style multiple processes (WORLD_SIZE={torchrun_world_size}). "
+            "Expose multiple GPUs to one Python process instead, e.g. CUDA_VISIBLE_DEVICES=0,1 python scripts/train.py ..."
+        )
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(

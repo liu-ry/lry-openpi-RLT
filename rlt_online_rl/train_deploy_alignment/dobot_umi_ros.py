@@ -28,7 +28,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -847,6 +847,7 @@ class UMIPoseRecorder(Node):
 
         # UMI 手柄夹爪编码器：使用 cal_encoder_position 几何映射（正弦公式）
         self._latest_umi_gripper_angle: float | None = None  # 最新编码器角度（度），None=未收到
+        self._policy_enabled_getter: Callable[[], bool] | None = None
 
         self._lock = threading.Lock()
 
@@ -966,6 +967,12 @@ class UMIPoseRecorder(Node):
         """
         if msg.encoder_status != 0:
             return
+        if self._policy_enabled_getter is not None:
+            try:
+                if bool(self._policy_enabled_getter()):
+                    return
+            except Exception:
+                pass
 
         angle = float(msg.gripper_angle)
         with self._lock:
@@ -982,6 +989,9 @@ class UMIPoseRecorder(Node):
     def is_ready(self) -> bool:
         with self._lock:
             return self._latest_T is not None
+
+    def bind_policy_enabled_getter(self, getter: Callable[[], bool]) -> None:
+        self._policy_enabled_getter = getter
 
     def set_alignment_reference(self) -> None:
         """对齐参考帧：在用户按 't' 并手动对齐后自动调用。
@@ -1169,8 +1179,16 @@ class DobotUMIRobotBridge:
     # policy 每步各关节最大允许变化量（弧度）。
     # 比 teleop 更保守，用于抑制 ref_chunk / actor 推理异常时的单步突跳。
     DEFAULT_POLICY_MAX_DELTA_RAD: float = 0.03
+    # policy ServoJ EMA 默认更强，抑制 VLA/ref_chunk 的高频小抖。
+    DEFAULT_POLICY_EMA_ALPHA: float = 0.25
+    # policy 关节死区；小于该阈值的命令变化视为推理噪声并保持上一平滑目标。
+    DEFAULT_POLICY_DEADBAND_RAD: float = 0.0015
     # policy 夹爪每步最大变化量（米）
     DEFAULT_POLICY_MAX_DELTA_GRIPPER_M: float = 0.01
+    # policy 夹爪目标 EMA；越小越平滑，抑制接触前后的微小开合抖动。
+    DEFAULT_POLICY_GRIPPER_EMA_ALPHA: float = 0.2
+    # policy 夹爪死区；小于该开合变化时保持上一目标，避免在抓取附近反复开合。
+    DEFAULT_POLICY_GRIPPER_DEADBAND_M: float = 0.003
     # rollout 层统一动作增量限幅默认值（6 关节 + 夹爪）。
     # 作为 robot bridge 关节增量限幅之前的第一道保险。
     DEFAULT_ACTION_DELTA_LIMITS: tuple[float, ...] = (0.02, 0.02, 0.02, 0.03, 0.03, 0.03, 0.005)
@@ -1186,11 +1204,13 @@ class DobotUMIRobotBridge:
         self._cam_recorder = cam_recorder
         self._arm = arm
         self._gripper = gripper
+        self._control_state_lock = threading.Lock()
         # 上一次实际发送的关节角（用于逐步限幅，None 表示尚未发送过）
         self._last_sent_q6: np.ndarray | None = None
         self._last_sent_gripper_m: float | None = None
         # EMA 平滑缓冲（用于抑制 ServoJ 微抖）
         self._ema_q6: np.ndarray | None = None
+        self._ema_gripper_m: float | None = None
         self._last_ema_source: str | None = None
 
     def shutdown(self) -> None:
@@ -1251,56 +1271,92 @@ class DobotUMIRobotBridge:
         if action7.shape[0] < 7:
             raise ValueError(f"动作维度不足 7，当前 {action7.shape}")
 
-        q6_desired = action7[:6]
-        gripper_travel_desired = float(np.clip(action7[6], 0.0, DEFAULT_GRIPPER_POS_CLOSE))
-        gripper_m_desired = _gripper_travel_to_m(
-            gripper_travel_desired,
-            max_gripper_m=self._args.max_gripper_m,
-        )
-        if _source == "policy":
-            max_dq = float(
-                getattr(
-                    self._args,
-                    "policy_max_delta_rad",
-                    DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_RAD,
-                )
+        with self._control_state_lock:
+            q6_desired = action7[:6]
+            gripper_travel_desired = float(np.clip(action7[6], 0.0, DEFAULT_GRIPPER_POS_CLOSE))
+            gripper_m_desired = _gripper_travel_to_m(
+                gripper_travel_desired,
+                max_gripper_m=self._args.max_gripper_m,
             )
-            max_dg = float(
-                getattr(
-                    self._args,
-                    "policy_max_delta_gripper_m",
-                    DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_GRIPPER_M,
+            if _source == "policy":
+                max_dq = float(
+                    getattr(
+                        self._args,
+                        "policy_max_delta_rad",
+                        DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_RAD,
+                    )
                 )
-            )
-        else:
-            max_dq = float(
-                getattr(
-                    self._args,
-                    "teleop_max_delta_rad",
-                    DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_RAD,
+                max_dg = float(
+                    getattr(
+                        self._args,
+                        "policy_max_delta_gripper_m",
+                        DobotUMIRobotBridge.DEFAULT_POLICY_MAX_DELTA_GRIPPER_M,
+                    )
                 )
-            )
-            max_dg = float(
-                getattr(
-                    self._args,
-                    "teleop_max_delta_gripper_m",
-                    DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M,
+            else:
+                max_dq = float(
+                    getattr(
+                        self._args,
+                        "teleop_max_delta_rad",
+                        DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_RAD,
+                    )
                 )
-            )
+                max_dg = float(
+                    getattr(
+                        self._args,
+                        "teleop_max_delta_gripper_m",
+                        DobotUMIRobotBridge.DEFAULT_TELEOP_MAX_DELTA_GRIPPER_M,
+                    )
+                )
 
-        if _source == "policy":
-            ema_alpha = float(getattr(self._args, "policy_ema_alpha", 0.35))
-        else:
-            ema_alpha = float(getattr(self._args, "teleop_ema_alpha", 0.5))
+            if _source == "policy":
+                ema_alpha = float(getattr(self._args, "policy_ema_alpha", 0.35))
+            else:
+                ema_alpha = float(getattr(self._args, "teleop_ema_alpha", 0.5))
 
-        q6, gripper_m, clipped = self._limit_action_step(
-            q6_desired=q6_desired,
-            gripper_m_desired=gripper_m_desired,
-            max_dq=max_dq,
-            max_dg=max_dg,
-        )
-        q6_sent = self._apply_ema_and_send(q6, gripper_m, alpha=ema_alpha, source=_source)
-        gripper_travel_sent = _gripper_m_to_travel(gripper_m, max_gripper_m=self._args.max_gripper_m)
+            q6, gripper_m, clipped = self._limit_action_step(
+                q6_desired=q6_desired,
+                gripper_m_desired=gripper_m_desired,
+                max_dq=max_dq,
+                max_dg=max_dg,
+            )
+            deadband_rad = 0.0
+            if _source == "policy":
+                deadband_rad = float(
+                    getattr(
+                        self._args,
+                        "policy_deadband_rad",
+                        DobotUMIRobotBridge.DEFAULT_POLICY_DEADBAND_RAD,
+                    )
+                )
+            gripper_deadband_m = 0.0
+            gripper_ema_alpha = 1.0
+            if _source == "policy":
+                gripper_deadband_m = float(
+                    getattr(
+                        self._args,
+                        "policy_gripper_deadband_m",
+                        DobotUMIRobotBridge.DEFAULT_POLICY_GRIPPER_DEADBAND_M,
+                    )
+                )
+                gripper_ema_alpha = float(
+                    getattr(
+                        self._args,
+                        "policy_gripper_ema_alpha",
+                        DobotUMIRobotBridge.DEFAULT_POLICY_GRIPPER_EMA_ALPHA,
+                    )
+                )
+
+            q6_sent, gripper_m_sent = self._apply_ema_and_send(
+                q6,
+                gripper_m,
+                alpha=ema_alpha,
+                source=_source,
+                deadband_rad=deadband_rad,
+                gripper_alpha=gripper_ema_alpha,
+                gripper_deadband_m=gripper_deadband_m,
+            )
+        gripper_travel_sent = _gripper_m_to_travel(gripper_m_sent, max_gripper_m=self._args.max_gripper_m)
         if clipped:
             logger.warning(
                 "[EXEC|%s CLIPPED] desired_deg=%s limited_deg=%s sent_deg=%s desired_gripper=%.1f limited_gripper=%.1f gripper_mm=%.1f",
@@ -1310,7 +1366,7 @@ class DobotUMIRobotBridge:
                 np.round(np.rad2deg(q6_sent), 2).tolist(),
                 gripper_travel_desired,
                 gripper_travel_sent,
-                gripper_m * 1000,
+                gripper_m_sent * 1000,
             )
         return np.concatenate(
             [q6_sent.astype(np.float32, copy=False), np.asarray([gripper_travel_sent], dtype=np.float32)]
@@ -1349,25 +1405,50 @@ class DobotUMIRobotBridge:
         )
         return q6, gripper_m, clipped
 
-    def _apply_ema_and_send(self, q6: np.ndarray, gripper_m: float, *, alpha: float, source: str) -> np.ndarray:
+    def _apply_ema_and_send(
+        self,
+        q6: np.ndarray,
+        gripper_m: float,
+        *,
+        alpha: float,
+        source: str,
+        deadband_rad: float = 0.0,
+        gripper_alpha: float = 1.0,
+        gripper_deadband_m: float = 0.0,
+    ) -> tuple[np.ndarray, float]:
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        gripper_alpha = float(np.clip(gripper_alpha, 0.0, 1.0))
         if self._ema_q6 is None or self._last_ema_source != source:
             self._ema_q6 = q6.copy()
+            self._ema_gripper_m = float(gripper_m)
         else:
+            if deadband_rad > 0.0:
+                delta = q6 - self._ema_q6
+                q6 = np.where(np.abs(delta) < deadband_rad, self._ema_q6, q6)
             self._ema_q6 = alpha * q6 + (1.0 - alpha) * self._ema_q6
+            if self._ema_gripper_m is None:
+                self._ema_gripper_m = float(gripper_m)
+            if gripper_deadband_m > 0.0 and abs(float(gripper_m) - float(self._ema_gripper_m)) < gripper_deadband_m:
+                gripper_m = float(self._ema_gripper_m)
+            self._ema_gripper_m = float(gripper_alpha * gripper_m + (1.0 - gripper_alpha) * self._ema_gripper_m)
+        if self._ema_gripper_m is None:
+            self._ema_gripper_m = float(gripper_m)
         self._last_ema_source = source
         control_hz = float(getattr(self._args, "control_frequency_hz", 20.0))
         # ServoJ 的 t 应与控制周期一致；SDK 文档下限约为 0.02s。
         servo_t = max(0.02, 1.0 / control_hz)
         self._arm.servo_j(self._ema_q6, t=servo_t)
-        self._gripper.set_opening_m(gripper_m)
-        return self._ema_q6.copy()
+        self._gripper.set_opening_m(float(self._ema_gripper_m))
+        return self._ema_q6.copy(), float(self._ema_gripper_m)
 
     def reset_teleop_state(self) -> None:
         """清除控制缓存，强制后续首步以当前实测状态为基准。"""
-        self._last_sent_q6 = None
-        self._last_sent_gripper_m = None
-        self._ema_q6 = None  # 清空 EMA 缓冲，避免上次遥操作状态污染新一轮
-        self._last_ema_source = None
+        with self._control_state_lock:
+            self._last_sent_q6 = None
+            self._last_sent_gripper_m = None
+            self._ema_q6 = None  # 清空 EMA 缓冲，避免上次遥操作状态污染新一轮
+            self._ema_gripper_m = None
+            self._last_ema_source = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1626,8 +1707,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policy_ema_alpha",
         type=float,
-        default=0.8,
-        help="policy 路径 ServoJ EMA 平滑系数。默认 0.35，比 teleop 更保守。",
+        default=DobotUMIRobotBridge.DEFAULT_POLICY_EMA_ALPHA,
+        help="policy 路径 ServoJ EMA 平滑系数。默认 0.25，越小越平滑但延迟越大。",
+    )
+    parser.add_argument(
+        "--policy_deadband_rad",
+        type=float,
+        default=DobotUMIRobotBridge.DEFAULT_POLICY_DEADBAND_RAD,
+        help="policy 路径关节死区。小于该弧度阈值的变化视为推理噪声并保持上一平滑目标；设 0 禁用。",
+    )
+    parser.add_argument(
+        "--policy_gripper_ema_alpha",
+        type=float,
+        default=DobotUMIRobotBridge.DEFAULT_POLICY_GRIPPER_EMA_ALPHA,
+        help="policy 路径夹爪 EMA 平滑系数。默认 0.2，越小越平滑但闭合响应更慢。",
+    )
+    parser.add_argument(
+        "--policy_gripper_deadband_m",
+        type=float,
+        default=DobotUMIRobotBridge.DEFAULT_POLICY_GRIPPER_DEADBAND_M,
+        help="policy 路径夹爪死区。小于该开合变化时保持上一目标，默认 0.003 m；设 0 禁用。",
     )
 
     # ── 训练控制 ─────────────────────────────────────────────────────────────
@@ -1722,6 +1821,7 @@ def main() -> None:
         smooth_alpha=_smooth_alpha,
         encoder_topic=args.umi_encoder_topic or None,
     )
+    umi_pose_recorder.bind_policy_enabled_getter(intervention_state.is_policy_enabled)
 
     # UMI 触发服务（切换策略/人工模式，切换时自动对齐参考帧）
     robot = DobotUMIRobotBridge(args, cam_recorder, arm, gripper)

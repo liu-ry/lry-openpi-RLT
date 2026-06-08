@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import contextlib
 import logging
 import multiprocessing
 import os
@@ -17,6 +18,29 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+@contextlib.contextmanager
+def _jax_cpu_only_worker_env(num_workers: int):
+    """Make spawned DataLoader workers import JAX without touching GPUs."""
+    if num_workers <= 0:
+        yield
+        return
+
+    keys = ("JAX_PLATFORMS", "CUDA_VISIBLE_DEVICES", "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
+    previous = {key: os.environ.get(key) for key in keys}
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 class Dataset(Protocol[T_co]):
@@ -417,6 +441,7 @@ class TorchDataLoader:
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
+        self._num_workers = num_workers
         if sharding is None and framework == "jax":
             # Use data parallel sharding by default for JAX only.
             self._sharding = jax.sharding.NamedSharding(
@@ -452,7 +477,8 @@ class TorchDataLoader:
     def __iter__(self):
         num_items = 0
         while True:
-            data_iter = iter(self._data_loader)
+            with _jax_cpu_only_worker_env(self._num_workers):
+                data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
