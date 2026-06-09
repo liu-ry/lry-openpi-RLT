@@ -1028,6 +1028,21 @@ class UMIPoseRecorder(Node):
         except Exception as e:
             logger.warning("[set_alignment_reference] ❌ 异常: %s", e, exc_info=True)
 
+    def invalidate_alignment_reference(self) -> None:
+        """立刻废弃旧对齐参考，直到新的参考帧写入前都只允许原地保持。
+
+        按 `t` 从 policy 切到 teleop 时，新的 set_alignment_reference() 是异步线程。
+        若这段空窗里仍沿用上一次 teleop 的参考帧，首个 teleop step 可能按旧参考
+        计算增量，造成危险突跳。这里先清空参考和上次输出，强制 snapshot_latest()
+        在新参考就绪前走 hold-current 路径。
+        """
+        with self._lock:
+            self._T_umi_ref = None
+            self._T_ee_ref = None
+            self._q_ref = None
+            self._last_output = None
+        logger.warning("[invalidate_alignment_reference] Cleared stale teleop alignment reference.")
+
     def snapshot_latest(self) -> tuple[np.ndarray | None, int]:
         """返回 (7D 动作, seq_id)。
 
@@ -1148,6 +1163,7 @@ class DobotUMITeleopTriggerNode(TeleopTriggerNode):
                            response.success, response.message)
             if response.success and "mode=teleop" in response.message:
                 logger.warning("[_on_trigger] 切换到人工模式 → 异步记录 UMI 对齐参考帧 + 重置限幅基准")
+                self._umi_pose_recorder.invalidate_alignment_reference()
                 self._robot_bridge.reset_teleop_state()
                 threading.Thread(
                     target=self._umi_pose_recorder.set_alignment_reference,
@@ -1186,9 +1202,9 @@ class DobotUMIRobotBridge:
     # policy 夹爪每步最大变化量（米）
     DEFAULT_POLICY_MAX_DELTA_GRIPPER_M: float = 0.01
     # policy 夹爪目标 EMA；越小越平滑，抑制接触前后的微小开合抖动。
-    DEFAULT_POLICY_GRIPPER_EMA_ALPHA: float = 0.2
+    DEFAULT_POLICY_GRIPPER_EMA_ALPHA: float = 1.0
     # policy 夹爪死区；小于该开合变化时保持上一目标，避免在抓取附近反复开合。
-    DEFAULT_POLICY_GRIPPER_DEADBAND_M: float = 0.003
+    DEFAULT_POLICY_GRIPPER_DEADBAND_M: float = 0.0
     # rollout 层统一动作增量限幅默认值（6 关节 + 夹爪）。
     # 作为 robot bridge 关节增量限幅之前的第一道保险。
     DEFAULT_ACTION_DELTA_LIMITS: tuple[float, ...] = (0.02, 0.02, 0.02, 0.03, 0.03, 0.03, 0.005)

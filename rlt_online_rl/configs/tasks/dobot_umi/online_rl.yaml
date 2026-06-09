@@ -32,7 +32,7 @@ experiment:
     actor_update_period: 2
 
     # warmup_min_size：收集到 600 条 transition 后进入在线 RL 阶段
-    warmup_min_size: 350
+    warmup_min_size: 300
     warmup_post_collect_updates: 20000
     freeze_after_warmup: false
     grad_updates_per_cycle: 10
