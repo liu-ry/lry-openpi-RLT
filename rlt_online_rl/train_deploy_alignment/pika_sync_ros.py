@@ -518,6 +518,15 @@ class StaticOnlinePhaseController:
     def bind_learner_status_getter(self, _getter: Callable[[], dict[str, Any]]) -> None:
         return
 
+    def bind_online_approval_getter(self, _getter: Callable[[], bool]) -> None:
+        return
+
+    def bind_online_approval_consumer(self, _consumer: Callable[[], bool]) -> None:
+        return
+
+    def bind_next_episode_request_getter(self, _getter: Callable[[], bool]) -> None:
+        return
+
     def begin_episode(self) -> str:
         return "online"
 

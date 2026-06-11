@@ -1202,7 +1202,7 @@ class DobotUMIRobotBridge:
     # policy 夹爪每步最大变化量（米）
     DEFAULT_POLICY_MAX_DELTA_GRIPPER_M: float = 0.01
     # policy 夹爪目标 EMA；越小越平滑，抑制接触前后的微小开合抖动。
-    DEFAULT_POLICY_GRIPPER_EMA_ALPHA: float = 1.0
+    DEFAULT_POLICY_GRIPPER_EMA_ALPHA: float = 0.9
     # policy 夹爪死区；小于该开合变化时保持上一目标，避免在抓取附近反复开合。
     DEFAULT_POLICY_GRIPPER_DEADBAND_M: float = 0.0
     # rollout 层统一动作增量限幅默认值（6 关节 + 夹爪）。

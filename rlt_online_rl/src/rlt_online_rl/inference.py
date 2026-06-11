@@ -644,20 +644,57 @@ class MachineAFeatureClient:
         self._ws = self._wait_for_server()
 
     def _infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+        is_batch = isinstance(observation.get("batch"), list)
+        batch_size = len(observation["batch"]) if is_batch else 1
+        request_kind = "batch" if is_batch else "single"
         payload = self._packer.pack(observation)
+        request_start = time.monotonic()
         for attempt in range(2):
             try:
+                attempt_start = time.monotonic()
                 self._ws.send(payload)
                 response = self._ws.recv(timeout=self._recv_timeout_sec)
+                attempt_elapsed_ms = (time.monotonic() - attempt_start) * 1000.0
+                total_elapsed_ms = (time.monotonic() - request_start) * 1000.0
+                response_size = len(response) if isinstance(response, bytes | bytearray | str) else -1
+                logger.info(
+                    "Machine A infer request done kind=%s batch_size=%s attempt=%s "
+                    "roundtrip_ms=%.1f total_ms=%.1f payload_bytes=%s response_bytes=%s",
+                    request_kind,
+                    batch_size,
+                    attempt + 1,
+                    attempt_elapsed_ms,
+                    total_elapsed_ms,
+                    len(payload),
+                    response_size,
+                )
                 break
             except (
                 OSError,
                 TimeoutError,
                 websocket_exceptions.ConnectionClosed,
             ) as exc:
+                elapsed_ms = (time.monotonic() - request_start) * 1000.0
                 if attempt == 1:
+                    logger.warning(
+                        "Machine A infer request failed kind=%s batch_size=%s attempts=%s elapsed_ms=%.1f error=%s",
+                        request_kind,
+                        batch_size,
+                        attempt + 1,
+                        elapsed_ms,
+                        exc,
+                    )
                     raise RuntimeError(f"Machine A feature request failed: {exc}") from exc
-                logger.warning("Machine A websocket request failed; reconnecting to %s: %s", self._ws_url, exc)
+                logger.warning(
+                    "Machine A websocket request failed kind=%s batch_size=%s attempt=%s elapsed_ms=%.1f; "
+                    "reconnecting to %s: %s",
+                    request_kind,
+                    batch_size,
+                    attempt + 1,
+                    elapsed_ms,
+                    self._ws_url,
+                    exc,
+                )
                 self._reconnect()
         if isinstance(response, str):
             raise RuntimeError(f"Machine A feature service error:\n{response}")
