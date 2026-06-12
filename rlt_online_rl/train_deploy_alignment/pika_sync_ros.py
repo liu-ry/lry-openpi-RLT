@@ -47,6 +47,10 @@ except Exception:
 from manual_signal_bridge import ENTER_CRITICAL_PHASE_SERVICE
 from manual_signal_bridge import RECORD_DONE_SERVICE
 from manual_signal_bridge import RECORD_FAILURE_SERVICE
+from manual_signal_bridge import RECORD_SCORE_0_SERVICE
+from manual_signal_bridge import RECORD_SCORE_1_SERVICE
+from manual_signal_bridge import RECORD_SCORE_2_SERVICE
+from manual_signal_bridge import RECORD_SCORE_3_SERVICE
 from manual_signal_bridge import RECORD_SUCCESS_SERVICE
 from manual_signal_bridge import REQUEST_NEXT_EPISODE_SERVICE
 from manual_signal_bridge import SET_CRITICAL_POLICY_ACTOR_SERVICE
@@ -55,6 +59,7 @@ from manual_signal_bridge import SIGNAL_CRITICAL_STARTED
 from manual_signal_bridge import SIGNAL_EPISODE_CRITICAL_POLICY
 from manual_signal_bridge import SIGNAL_MANUAL_DONE_PENDING
 from manual_signal_bridge import SIGNAL_MANUAL_FAILURE_PENDING
+from manual_signal_bridge import SIGNAL_MANUAL_SCORE_PENDING
 from manual_signal_bridge import SIGNAL_MANUAL_SUCCESS_PENDING
 from manual_signal_bridge import SIGNAL_NEXT_EPISODE_REQUESTED
 from manual_signal_bridge import SIGNAL_ONLINE_APPROVED
@@ -153,6 +158,7 @@ class RolloutRuntimeContext:
             self.signal_values[SIGNAL_NEXT_EPISODE_REQUESTED] = False
             self.signal_values[SIGNAL_MANUAL_SUCCESS_PENDING] = False
             self.signal_values[SIGNAL_MANUAL_FAILURE_PENDING] = False
+            self.signal_values[SIGNAL_MANUAL_SCORE_PENDING] = None
             self.signal_values[SIGNAL_MANUAL_DONE_PENDING] = False
             self.signal_values.setdefault(SIGNAL_ONLINE_APPROVED, False)
             self._condition.notify_all()
@@ -192,20 +198,20 @@ class RolloutRuntimeContext:
             self.signal_values[SIGNAL_NEXT_EPISODE_REQUESTED] = False
 
     def mark_manual_success(self) -> None:
+        self.mark_manual_score(3)
+
+    def mark_manual_score(self, score: int) -> None:
+        clamped_score = max(0, min(int(score), 3))
         self.intervention_state.enter_episode_reset()
         with self._condition:
-            self.signal_values[SIGNAL_MANUAL_SUCCESS_PENDING] = True
-            self.signal_values[SIGNAL_MANUAL_FAILURE_PENDING] = False
+            self.signal_values[SIGNAL_MANUAL_SUCCESS_PENDING] = clamped_score > 0
+            self.signal_values[SIGNAL_MANUAL_FAILURE_PENDING] = clamped_score <= 0
+            self.signal_values[SIGNAL_MANUAL_SCORE_PENDING] = clamped_score
             self.signal_values[SIGNAL_MANUAL_DONE_PENDING] = True
             self._condition.notify_all()
 
     def mark_manual_failure(self) -> None:
-        self.intervention_state.enter_episode_reset()
-        with self._condition:
-            self.signal_values[SIGNAL_MANUAL_FAILURE_PENDING] = True
-            self.signal_values[SIGNAL_MANUAL_SUCCESS_PENDING] = False
-            self.signal_values[SIGNAL_MANUAL_DONE_PENDING] = True
-            self._condition.notify_all()
+        self.mark_manual_score(0)
 
     def mark_manual_done(self) -> None:
         self.intervention_state.enter_episode_reset()
@@ -1070,11 +1076,14 @@ def _coerce_reward_output(reward: np.ndarray | list[float] | float, executed_ste
     return [float(x) for x in reward_array]
 
 
-def _manual_terminal_events(signals: dict[str, Any]) -> tuple[bool, bool, bool]:
-    success = bool(signals.get(SIGNAL_MANUAL_SUCCESS_PENDING, False))
-    failure = bool(signals.get(SIGNAL_MANUAL_FAILURE_PENDING, False))
+def _manual_terminal_events(signals: dict[str, Any]) -> tuple[int, bool, bool, bool]:
     done = bool(signals.get(SIGNAL_MANUAL_DONE_PENDING, False))
-    return success, failure, done
+    raw_score = signals.get(SIGNAL_MANUAL_SCORE_PENDING, None)
+    has_score = raw_score is not None and raw_score is not False and raw_score != ""
+    score = max(0, min(int(raw_score), 3)) if has_score else 0
+    success = bool(signals.get(SIGNAL_MANUAL_SUCCESS_PENDING, False) or (has_score and score > 0))
+    failure = bool(signals.get(SIGNAL_MANUAL_FAILURE_PENDING, False) or (has_score and score == 0 and done))
+    return score, success, failure, done
 
 
 def _default_reward_fn(
@@ -1085,9 +1094,9 @@ def _default_reward_fn(
 ) -> np.ndarray:
     executed_steps = int(context["executed_steps"])
     rewards = np.zeros((executed_steps,), dtype=np.float32)
-    success, _, _ = _manual_terminal_events(context["signals"])
-    if executed_steps > 0 and success:
-        rewards[-1] = 1.0
+    score, _, _, _ = _manual_terminal_events(context["signals"])
+    if executed_steps > 0 and score > 0:
+        rewards[-1] = float(score) / 3.0
     return rewards
 
 
@@ -1096,7 +1105,7 @@ def _default_success_fn(
     _next_observation: dict[str, Any],
     context: dict[str, Any],
 ) -> bool:
-    success, _, _ = _manual_terminal_events(context["signals"])
+    _, success, _, _ = _manual_terminal_events(context["signals"])
     return success
 
 
@@ -1105,7 +1114,7 @@ def _default_done_fn(
     _next_observation: dict[str, Any],
     context: dict[str, Any],
 ) -> bool:
-    _, failure, done = _manual_terminal_events(context["signals"])
+    _, _, failure, done = _manual_terminal_events(context["signals"])
     return bool(failure or done)
 
 
@@ -1286,8 +1295,9 @@ class PikaChunkEnvAdapter:
             executed_steps=len(executed),
         )
         success = int(bool(self._success_fn(observation, next_observation, context)))
+        manual_score, _, _, _ = _manual_terminal_events(signal_snapshot)
         if success and rewards and not any(float(reward) > 0.0 for reward in rewards):
-            rewards[-1] = 1.0
+            rewards[-1] = float(manual_score if manual_score > 0 else 3) / 3.0
             logger.warning(
                 "Success recorded without a positive reward in the executed chunk; forcing terminal reward on the last executed step."
             )
@@ -1401,20 +1411,21 @@ class PikaChunkEnvAdapter:
             self._wait_until_policy_active()
 
     def _consume_manual_terminal_events(self, signal_snapshot: dict[str, Any]) -> None:
-        to_clear = [
-            name
-            for name in (
-                SIGNAL_MANUAL_SUCCESS_PENDING,
-                SIGNAL_MANUAL_FAILURE_PENDING,
-                SIGNAL_MANUAL_DONE_PENDING,
-            )
-            if bool(signal_snapshot.get(name, False))
-        ]
+        to_clear = []
+        for name in (
+            SIGNAL_MANUAL_SUCCESS_PENDING,
+            SIGNAL_MANUAL_FAILURE_PENDING,
+            SIGNAL_MANUAL_DONE_PENDING,
+        ):
+            if bool(signal_snapshot.get(name, False)):
+                to_clear.append(name)
+        if SIGNAL_MANUAL_SCORE_PENDING in signal_snapshot:
+            to_clear.append(SIGNAL_MANUAL_SCORE_PENDING)
         if to_clear:
             self._runtime_context.clear_signals(*to_clear)
 
     def _manual_terminal_requested(self) -> bool:
-        success, failure, done = _manual_terminal_events(self._runtime_context.snapshot_signals())
+        _, success, failure, done = _manual_terminal_events(self._runtime_context.snapshot_signals())
         return bool(success or failure or done)
 
     def _reset_target_for_mode(self) -> np.ndarray | None:
@@ -1794,10 +1805,11 @@ def main() -> None:
     logger.info("Min online actor version: %s", min_online_actor_version)
     logger.info("Learner status path: %s", learner_status_path)
     logger.info(
-        "Manual services next=%s success=%s failure=%s done=%s critical=%s toggle_critical=%s select_actor=%s select_base=%s",
+        "Manual services next=%s success=%s failure=%s scores=%s done=%s critical=%s toggle_critical=%s select_actor=%s select_base=%s",
         REQUEST_NEXT_EPISODE_SERVICE,
         RECORD_SUCCESS_SERVICE,
         RECORD_FAILURE_SERVICE,
+        f"{RECORD_SCORE_0_SERVICE},{RECORD_SCORE_1_SERVICE},{RECORD_SCORE_2_SERVICE},{RECORD_SCORE_3_SERVICE}",
         RECORD_DONE_SERVICE,
         ENTER_CRITICAL_PHASE_SERVICE,
         TOGGLE_CRITICAL_PHASE_SERVICE,

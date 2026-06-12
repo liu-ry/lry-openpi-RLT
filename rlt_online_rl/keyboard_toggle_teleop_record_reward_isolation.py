@@ -10,6 +10,10 @@ from std_srvs.srv import Trigger
 from train_deploy_alignment.manual_signal_bridge import APPROVE_ONLINE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import ENTER_CRITICAL_PHASE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_FAILURE_SERVICE
+from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_0_SERVICE
+from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_1_SERVICE
+from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_2_SERVICE
+from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_3_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_SUCCESS_SERVICE
 from train_deploy_alignment.manual_signal_bridge import REQUEST_NEXT_EPISODE_SERVICE
 
@@ -55,6 +59,10 @@ class KeyboardTeleopRecordRewardToggle(Node):
         self.next_episode_cli = self.create_client(Trigger, REQUEST_NEXT_EPISODE_SERVICE)
         self.success_cli = self.create_client(Trigger, RECORD_SUCCESS_SERVICE)
         self.failure_cli = self.create_client(Trigger, RECORD_FAILURE_SERVICE)
+        self.score0_cli = self.create_client(Trigger, RECORD_SCORE_0_SERVICE)
+        self.score1_cli = self.create_client(Trigger, RECORD_SCORE_1_SERVICE)
+        self.score2_cli = self.create_client(Trigger, RECORD_SCORE_2_SERVICE)
+        self.score3_cli = self.create_client(Trigger, RECORD_SCORE_3_SERVICE)
         self.critical_phase_cli = self.create_client(Trigger, ENTER_CRITICAL_PHASE_SERVICE)
         self.online_approval_cli = self.create_client(Trigger, APPROVE_ONLINE_SERVICE)
         self.control_mode = "unknown"
@@ -71,6 +79,10 @@ class KeyboardTeleopRecordRewardToggle(Node):
 
         self.success_cli.wait_for_service()
         self.failure_cli.wait_for_service()
+        self.score0_cli.wait_for_service()
+        self.score1_cli.wait_for_service()
+        self.score2_cli.wait_for_service()
+        self.score3_cli.wait_for_service()
         self.critical_phase_cli.wait_for_service()
         self.online_approval_cli.wait_for_service()
 
@@ -80,7 +92,8 @@ class KeyboardTeleopRecordRewardToggle(Node):
     def _ready_message(self) -> str:
         return (
             "Ready. Press 't' to toggle teleop. Press 'o' to start the next episode. "
-            "Press 's' to end the episode with success. Press 'f' to end the episode with failure. "
+            "Press 's' to end the episode with legacy success(=3). Press 'f' to end the episode with failure(=0). "
+            "Press '0'/'1'/'2'/'3' to record graded terminal scores. "
             "Press 'c' to enter the critical phase. Press Enter to approve warmup->RL switch. Press 'q' to quit."
         )
 
@@ -242,6 +255,16 @@ class KeyboardTeleopRecordRewardToggle(Node):
     def record_failure(self):
         self._record_terminal(self.failure_cli, "failure")
 
+    def record_score(self, score: int):
+        clients = {
+            0: self.score0_cli,
+            1: self.score1_cli,
+            2: self.score2_cli,
+            3: self.score3_cli,
+        }
+        clamped_score = max(0, min(int(score), 3))
+        self._record_terminal(clients[clamped_score], f"score={clamped_score}")
+
     def enter_critical_phase(self):
         resp = self._call_trigger(self.critical_phase_cli, "Failed to enter the critical phase.")
         if resp is None:
@@ -282,6 +305,8 @@ def main():
                 node.record_success()
             elif ch == "f":
                 node.record_failure()
+            elif ch in ("0", "1", "2", "3"):
+                node.record_score(int(ch))
             elif ch == "c":
                 node.enter_critical_phase()
             elif ch in ("\r", "\n"):

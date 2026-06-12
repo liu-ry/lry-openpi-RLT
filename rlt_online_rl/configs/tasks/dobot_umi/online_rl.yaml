@@ -75,7 +75,7 @@ runtime:
     bind_host: 127.0.0.1
     port: 9102
     seed: 0
-    sample_strategy: stratified  # uniform / stratified
+    sample_strategy: uniform  # uniform / stratified
     recent_episode_window: 20
     recent_online_ratio: 0.3
     warmup_demo_ratio: 0.3
@@ -85,8 +85,8 @@ runtime:
   env_driver:
     # ── Machine A（Pi0 策略服务器）WebSocket 地址 ────────────────────────────
     # 修改为实际策略服务器 IP
-    machine_a_ws_url: ws://218.4.163.187:8099
-    # machine_a_ws_url: ws://192.168.3.5:8099
+    # machine_a_ws_url: ws://218.4.163.187:8099
+    machine_a_ws_url: ws://192.168.3.5:8099
     actor_service_url: http://127.0.0.1:9101
     replay_service_url: http://127.0.0.1:9102
 

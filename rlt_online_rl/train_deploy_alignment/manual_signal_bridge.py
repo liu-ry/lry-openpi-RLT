@@ -12,6 +12,10 @@ if TYPE_CHECKING:
 REQUEST_NEXT_EPISODE_SERVICE = "/request_next_episode"
 RECORD_SUCCESS_SERVICE = "/record_success"
 RECORD_FAILURE_SERVICE = "/record_failure"
+RECORD_SCORE_0_SERVICE = "/record_score_0"
+RECORD_SCORE_1_SERVICE = "/record_score_1"
+RECORD_SCORE_2_SERVICE = "/record_score_2"
+RECORD_SCORE_3_SERVICE = "/record_score_3"
 RECORD_DONE_SERVICE = "/record_done"
 ENTER_CRITICAL_PHASE_SERVICE = "/enter_critical_phase"
 TOGGLE_CRITICAL_PHASE_SERVICE = "/toggle_critical_phase"
@@ -22,6 +26,7 @@ APPROVE_ONLINE_SERVICE = "/approve_online_transition"
 SIGNAL_NEXT_EPISODE_REQUESTED = "next_episode_requested"
 SIGNAL_MANUAL_SUCCESS_PENDING = "manual_success_pending"
 SIGNAL_MANUAL_FAILURE_PENDING = "manual_failure_pending"
+SIGNAL_MANUAL_SCORE_PENDING = "manual_score_pending"
 SIGNAL_MANUAL_DONE_PENDING = "manual_done_pending"
 SIGNAL_CRITICAL_STARTED = "critical_started"
 SIGNAL_SELECTED_CRITICAL_POLICY = "selected_critical_policy"
@@ -42,6 +47,10 @@ class ManualSignalBridgeNode(Node):
         self.create_service(Trigger, REQUEST_NEXT_EPISODE_SERVICE, self._on_request_next_episode)
         self.create_service(Trigger, RECORD_SUCCESS_SERVICE, self._on_record_success)
         self.create_service(Trigger, RECORD_FAILURE_SERVICE, self._on_record_failure)
+        self.create_service(Trigger, RECORD_SCORE_0_SERVICE, self._on_record_score_0)
+        self.create_service(Trigger, RECORD_SCORE_1_SERVICE, self._on_record_score_1)
+        self.create_service(Trigger, RECORD_SCORE_2_SERVICE, self._on_record_score_2)
+        self.create_service(Trigger, RECORD_SCORE_3_SERVICE, self._on_record_score_3)
         self.create_service(Trigger, RECORD_DONE_SERVICE, self._on_record_done)
         self.create_service(Trigger, ENTER_CRITICAL_PHASE_SERVICE, self._on_enter_critical_phase)
         self.create_service(Trigger, TOGGLE_CRITICAL_PHASE_SERVICE, self._on_toggle_critical_phase)
@@ -53,6 +62,10 @@ class ManualSignalBridgeNode(Node):
             f"{REQUEST_NEXT_EPISODE_SERVICE} "
             f"{RECORD_SUCCESS_SERVICE} "
             f"{RECORD_FAILURE_SERVICE} "
+            f"{RECORD_SCORE_0_SERVICE} "
+            f"{RECORD_SCORE_1_SERVICE} "
+            f"{RECORD_SCORE_2_SERVICE} "
+            f"{RECORD_SCORE_3_SERVICE} "
             f"{RECORD_DONE_SERVICE} "
             f"{ENTER_CRITICAL_PHASE_SERVICE} "
             f"{TOGGLE_CRITICAL_PHASE_SERVICE} "
@@ -78,6 +91,24 @@ class ManualSignalBridgeNode(Node):
         response.success = True
         response.message = "Manual failure recorded."
         return response
+
+    def _record_score(self, score: int, response):
+        self._runtime_context.mark_manual_score(score)
+        response.success = True
+        response.message = f"Manual terminal score={int(score)} recorded."
+        return response
+
+    def _on_record_score_0(self, _request, response):
+        return self._record_score(0, response)
+
+    def _on_record_score_1(self, _request, response):
+        return self._record_score(1, response)
+
+    def _on_record_score_2(self, _request, response):
+        return self._record_score(2, response)
+
+    def _on_record_score_3(self, _request, response):
+        return self._record_score(3, response)
 
     def _on_record_done(self, _request, response):
         self._runtime_context.mark_manual_done()

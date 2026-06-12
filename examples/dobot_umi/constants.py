@@ -17,7 +17,7 @@ DOBOT_USE_FEEDBACK     = True             # 是否启动反馈线程（获取关
 # ─────────────────────────────────────────────────────────────
 # 知行夹爪 SDK 直驱参数（RS-485 串口）
 # ─────────────────────────────────────────────────────────────
-GRIPPER_SERIAL_PORT    = "/dev/ttyUSB0"   # USB-Serial 设备节点（CH340；ttyUSB0 被 micro_ros_agent 占用）
+GRIPPER_SERIAL_PORT    = "/dev/ttyUSB1"   # USB-Serial 设备节点；请按当前实际枚举结果修改
 GRIPPER_SLAVE_ID       = 1
 GRIPPER_BAUDRATE       = 115200
 GRIPPER_SPEED_PCT      = 5                # 运动速度百分比（1–100）
