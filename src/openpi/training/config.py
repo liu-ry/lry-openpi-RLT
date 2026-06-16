@@ -1210,7 +1210,7 @@ _CONFIGS = [
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
-            use_tactile=True,
+            use_tactile=False,
         ),
         data=LeRobotViTaiDataConfig(
             repo_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604",
@@ -1225,8 +1225,6 @@ _CONFIGS = [
                             "images": {
                                 "cam_front": "observation.images.cam_front",
                                 "cam_wrist": "observation.images.cam_wrist",
-                                "tactile_left": "observation.images.tactile_left",
-                                "tactile_right": "observation.images.tactile_right",
                             },
                             "state":   "observation.state",
                             "actions": "actions",
@@ -1261,7 +1259,7 @@ _CONFIGS = [
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
-            use_tactile=True,
+            use_tactile=False,
         ),
         data=LeRobotViTaiDataConfig(
             repo_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604",
@@ -1276,8 +1274,6 @@ _CONFIGS = [
                             "images": {
                                 "cam_front": "observation.images.cam_front",
                                 "cam_wrist": "observation.images.cam_wrist",
-                                "tactile_left": "observation.images.tactile_left",
-                                "tactile_right": "observation.images.tactile_right",
                             },
                             "state":   "observation.state",
                             "actions": "actions",
