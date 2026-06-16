@@ -439,31 +439,69 @@ class LeRobotViTaiDataConfig(DataConfigFactory):
     default_prompt: str | None = None
     use_xdof_bool_mask: bool = False
 
-    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
-        default=_transforms.Group(
+    repack_transforms: tyro.conf.Suppress[_transforms.Group | None] = None
+    action_sequence_keys: Sequence[str] = ("actions",)  # 与数据集中的 key 保持一致
+
+    @staticmethod
+    def _filter_repack_tactile(repack_transforms: _transforms.Group) -> _transforms.Group:
+        if not repack_transforms.inputs:
+            return repack_transforms
+        first = repack_transforms.inputs[0]
+        if not isinstance(first, _transforms.RepackTransform):
+            return repack_transforms
+        structure = dict(first.structure)
+        images = structure.get("images")
+        if not isinstance(images, dict):
+            return repack_transforms
+        filtered_images = {
+            key: value
+            for key, value in images.items()
+            if key not in {"tactile_left", "tactile_right"}
+        }
+        if filtered_images == images:
+            return repack_transforms
+        structure["images"] = filtered_images
+        return _transforms.Group(
+            inputs=[_transforms.RepackTransform(structure), *repack_transforms.inputs[1:]],
+            outputs=repack_transforms.outputs,
+        )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        image_repack = {
+            "cam_front": "observation.images.cam_front",
+            "cam_wrist": "observation.images.cam_wrist",
+        }
+        use_tactile = bool(getattr(model_config, "use_tactile", False))
+        if use_tactile:
+            image_repack.update(
+                {
+                    "tactile_left": "observation.images.tactile_left",
+                    "tactile_right": "observation.images.tactile_right",
+                }
+            )
+        repack_transforms = self.repack_transforms or _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        # 新数据集图像 key 映射 (dataset_key → internal_key)
-                        "images": {
-                            "cam_front":     "observation.images.cam_front",
-                            "cam_wrist":     "observation.images.cam_wrist",
-                            "tactile_left":  "observation.images.tactile_left",
-                            "tactile_right": "observation.images.tactile_right",
-                        },
-                        "state":   "observation.state",
-                        "actions": "actions",  # 数据集中存储的 key 为 "actions"
+                        "images": image_repack,
+                        "state": "observation.state",
+                        "actions": "actions",
                     }
                 )
             ]
         )
-    )
-    action_sequence_keys: Sequence[str] = ("actions",)  # 与数据集中的 key 保持一致
+        if not use_tactile:
+            repack_transforms = self._filter_repack_tactile(repack_transforms)
 
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[vitai_policy.ViTaiInputs(action_dim=model_config.action_dim)],
+            inputs=[
+                vitai_policy.ViTaiInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    use_tactile=use_tactile,
+                )
+            ],
             outputs=[vitai_policy.ViTaiOutputs()],
         )
 
@@ -483,7 +521,7 @@ class LeRobotViTaiDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
+            repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
@@ -1172,6 +1210,7 @@ _CONFIGS = [
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            use_tactile=True,
         ),
         data=LeRobotViTaiDataConfig(
             repo_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604",
@@ -1186,6 +1225,8 @@ _CONFIGS = [
                             "images": {
                                 "cam_front": "observation.images.cam_front",
                                 "cam_wrist": "observation.images.cam_wrist",
+                                "tactile_left": "observation.images.tactile_left",
+                                "tactile_right": "observation.images.tactile_right",
                             },
                             "state":   "observation.state",
                             "actions": "actions",
@@ -1220,6 +1261,7 @@ _CONFIGS = [
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            use_tactile=True,
         ),
         data=LeRobotViTaiDataConfig(
             repo_id="/data/vt_umi_dataset/converted_dataset/dobot_peg_in_hole_0604",
@@ -1234,6 +1276,8 @@ _CONFIGS = [
                             "images": {
                                 "cam_front": "observation.images.cam_front",
                                 "cam_wrist": "observation.images.cam_wrist",
+                                "tactile_left": "observation.images.tactile_left",
+                                "tactile_right": "observation.images.tactile_right",
                             },
                             "state":   "observation.state",
                             "actions": "actions",

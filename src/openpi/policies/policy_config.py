@@ -72,6 +72,11 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    metadata = {
+        **(train_config.policy_metadata or {}),
+        "use_tactile": bool(getattr(train_config.model, "use_tactile", False)),
+    }
+
     return _policy.Policy(
         model,
         transforms=[
@@ -88,7 +93,7 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata=metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )

@@ -161,7 +161,11 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation,
+            train=train,
+            use_tactile=self.config.use_tactile,
+        )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

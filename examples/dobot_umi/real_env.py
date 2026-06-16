@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import time
+from collections.abc import Callable
 from typing import Any
 
 import dm_env
@@ -67,6 +68,8 @@ class DobotUMIRealEnv:
         cam_fps: int = constants.REALSENSE_FPS,
         image_resize_hw: tuple[int, int] | None = None,
         obs_ready_timeout_s: float | None = 10.0,
+        enable_tactile: bool = False,
+        tactile_image_provider: Callable[[], dict[str, np.ndarray]] | None = None,
         # 复位姿态
         reset_joint_positions: list[float] | None = None,
     ):
@@ -76,6 +79,8 @@ class DobotUMIRealEnv:
             else list(constants.DEFAULT_RESET_JOINT_POSITIONS)
         )
         self._image_resize_hw = image_resize_hw
+        self._enable_tactile = enable_tactile
+        self._tactile_image_provider = tactile_image_provider
 
         # ── 机械臂 SDK ────────────────────────────────────────────────────────
         self.arm = _utils.DobotSDKArm(
@@ -141,10 +146,28 @@ class DobotUMIRealEnv:
         return np.concatenate([q6, [gripper_m]], dtype=np.float32)
 
     def get_images(self) -> dict[str, np.ndarray]:
-        """返回包含 'cam_front' 和 'cam_wrist' 的 RGB uint8 图像字典。"""
-        return self.image_recorder.get_images(
+        """返回图像字典；触觉开启时额外包含 tactile_left/tactile_right。"""
+        images = self.image_recorder.get_images(
             resize_hw=self._image_resize_hw,
         )
+        if not self._enable_tactile:
+            return images
+        if self._tactile_image_provider is None:
+            raise RuntimeError("enable_tactile=True 但未配置 tactile_image_provider")
+        tactile_images = self._tactile_image_provider()
+        missing = {
+            constants.IMAGE_KEY_TACTILE_LEFT,
+            constants.IMAGE_KEY_TACTILE_RIGHT,
+        } - set(tactile_images)
+        if missing:
+            raise RuntimeError(f"触觉图像 provider 缺少字段: {sorted(missing)}")
+        images.update(
+            {
+                constants.IMAGE_KEY_TACTILE_LEFT: tactile_images[constants.IMAGE_KEY_TACTILE_LEFT],
+                constants.IMAGE_KEY_TACTILE_RIGHT: tactile_images[constants.IMAGE_KEY_TACTILE_RIGHT],
+            }
+        )
+        return images
 
     def get_observation(self) -> dict[str, Any]:
         obs = collections.OrderedDict()
@@ -213,10 +236,14 @@ def make_real_env(
     *,
     reset_joint_positions: list[float] | None = None,
     image_resize_hw: tuple[int, int] | None = None,
+    enable_tactile: bool = False,
+    tactile_image_provider: Callable[[], dict[str, np.ndarray]] | None = None,
     **kwargs,
 ) -> DobotUMIRealEnv:
     return DobotUMIRealEnv(
         reset_joint_positions=reset_joint_positions,
         image_resize_hw=image_resize_hw,
+        enable_tactile=enable_tactile,
+        tactile_image_provider=tactile_image_provider,
         **kwargs,
     )

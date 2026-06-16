@@ -20,7 +20,9 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from collections import deque
+import logging
 from pathlib import Path
 from typing import Any, Optional
 
@@ -608,6 +610,8 @@ class RealSenseImageRecorder:
         width: int = constants.REALSENSE_WIDTH,
         height: int = constants.REALSENSE_HEIGHT,
         fps: int = constants.REALSENSE_FPS,
+        enable_tactile: bool = False,
+        tactile_image_provider: Callable[[], dict[str, np.ndarray]] | None = None,
     ):
         if not _HAS_REALSENSE:
             raise ImportError(
@@ -618,6 +622,8 @@ class RealSenseImageRecorder:
         self._width = width
         self._height = height
         self._fps = fps
+        self._enable_tactile = enable_tactile
+        self._tactile_image_provider = tactile_image_provider
 
         self._pipeline_front: Any = None
         self._pipeline_wrist: Any = None
@@ -792,10 +798,28 @@ class RealSenseImageRecorder:
             front = cv2.resize(front, (w, h), interpolation=cv2.INTER_LINEAR)
             wrist = cv2.resize(wrist, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        return {
+        images = {
             constants.IMAGE_KEY_FRONT: front.copy(),
             constants.IMAGE_KEY_WRIST: wrist.copy(),
         }
+        if not self._enable_tactile:
+            return images
+        if self._tactile_image_provider is None:
+            raise RuntimeError("enable_tactile=True 但未配置 tactile_image_provider")
+        tactile_images = self._tactile_image_provider()
+        missing = {
+            constants.IMAGE_KEY_TACTILE_LEFT,
+            constants.IMAGE_KEY_TACTILE_RIGHT,
+        } - set(tactile_images)
+        if missing:
+            raise RuntimeError(f"触觉图像 provider 缺少字段: {sorted(missing)}")
+        images.update(
+            {
+                constants.IMAGE_KEY_TACTILE_LEFT: tactile_images[constants.IMAGE_KEY_TACTILE_LEFT],
+                constants.IMAGE_KEY_TACTILE_RIGHT: tactile_images[constants.IMAGE_KEY_TACTILE_RIGHT],
+            }
+        )
+        return images
 
     def __del__(self):
         try:
@@ -806,6 +830,98 @@ class RealSenseImageRecorder:
 
 # 向后兼容别名（旧代码若直接用 DobotImageRecorder 仍可工作，但已不推荐）
 DobotImageRecorder = RealSenseImageRecorder
+
+
+class VitAITactileCamera:
+    """VitAI GF225 tactile sensors using pyvitaisdk warped images."""
+
+    def __init__(
+        self,
+        *,
+        serial_left: str = constants.TACTILE_LEFT_SERIAL,
+        serial_right: str = constants.TACTILE_RIGHT_SERIAL,
+    ):
+        self._serial_left = serial_left
+        self._serial_right = serial_right
+        self._sensor_left: Any = None
+        self._sensor_right: Any = None
+        self.connected = False
+
+    def connect(self) -> bool:
+        try:
+            from pyvitaisdk import GF225, GF225OutputProfile, VTSDeviceFinder
+
+            finder = VTSDeviceFinder()
+            available_sns = finder.get_sns()
+            logging.info("[VitAITactileCamera] devices found: %s", available_sns)
+
+            if self._serial_left not in available_sns:
+                logging.error(
+                    "[VitAITactileCamera] left sensor %r not found. Available: %s",
+                    self._serial_left,
+                    available_sns,
+                )
+                return False
+            if self._serial_right not in available_sns:
+                logging.error(
+                    "[VitAITactileCamera] right sensor %r not found. Available: %s",
+                    self._serial_right,
+                    available_sns,
+                )
+                return False
+
+            left_config = finder.get_device_by_sn(self._serial_left)
+            self._sensor_left = GF225(config=left_config, output_format=GF225OutputProfile.W240_H240)
+            self._sensor_left.calibrate()
+            logging.info("[VitAITactileCamera] left sensor %s connected and calibrated", self._serial_left)
+
+            right_config = finder.get_device_by_sn(self._serial_right)
+            self._sensor_right = GF225(config=right_config, output_format=GF225OutputProfile.W240_H240)
+            self._sensor_right.calibrate()
+            logging.info("[VitAITactileCamera] right sensor %s connected and calibrated", self._serial_right)
+
+            self.connected = True
+            return True
+        except ImportError:
+            logging.error("[VitAITactileCamera] pyvitaisdk not installed. Run: pip install pyvitaisdk")
+            return False
+        except Exception as exc:
+            logging.error("[VitAITactileCamera] failed to connect sensors: %s", exc)
+            return False
+
+    def get_images(self) -> dict[str, np.ndarray]:
+        """Return tactile warped images as HWC uint8 RGB with repo-standard keys."""
+        if not self.connected:
+            raise RuntimeError("VitAI tactile sensors are not connected")
+
+        from pyvitaisdk import VTSDataType as GFDataType
+
+        images: dict[str, np.ndarray] = {}
+        for label, sensor, out_key in (
+            ("left", self._sensor_left, constants.IMAGE_KEY_TACTILE_LEFT),
+            ("right", self._sensor_right, constants.IMAGE_KEY_TACTILE_RIGHT),
+        ):
+            try:
+                data = sensor.collect_sensor_data(GFDataType.WARPED_IMG)
+                warped_bgr = data[GFDataType.WARPED_IMG]
+                images[out_key] = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
+            except Exception as exc:
+                logging.warning("[VitAITactileCamera] failed to get %s tactile image: %s", label, exc)
+                images[out_key] = np.zeros((240, 240, 3), dtype=np.uint8)
+        return images
+
+    def disconnect(self) -> None:
+        for label, sensor in (("left", self._sensor_left), ("right", self._sensor_right)):
+            if sensor is None:
+                continue
+            try:
+                sensor.release()
+            except Exception as exc:
+                logging.warning("[VitAITactileCamera] error releasing %s sensor: %s", label, exc)
+        self._sensor_left = None
+        self._sensor_right = None
+        self.connected = False
+        logging.info("[VitAITactileCamera] disconnected")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

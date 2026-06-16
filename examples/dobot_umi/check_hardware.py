@@ -5,7 +5,8 @@
   2. 知行夹爪（RS-485 串口初始化 + 读取当前位置 + 可选开合测试）
   3. RealSense 正面相机（ROS 话题是否有图像帧到达）
   4. RealSense 腕部相机（同上）
-  5. UMI 示教设备（ROS 话题是否有动作帧到达，可不接）
+  5. VitAI GF225 触觉传感器（pyvitaisdk 连接 + 读取 warped image）
+  6. UMI 示教设备（ROS 话题是否有动作帧到达，可不接）
 
 用法::
 
@@ -316,7 +317,62 @@ def check_cameras(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 检测 5：UMI 示教设备（ROS 话题）
+# 检测 5：VitAI GF225 触觉传感器（pyvitaisdk）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_tactile(
+    serial_left: str,
+    serial_right: str,
+) -> bool:
+    print(_title("[4] VitAI GF225 触觉传感器（pyvitaisdk）"))
+    if not serial_left or not serial_right:
+        print(_fail("触觉传感器序列号未配置，请设置 --tactile_sn_left/--tactile_sn_right"))
+        return False
+
+    try:
+        from examples.dobot_umi.robot_utils import VitAITactileCamera  # noqa: PLC0415
+    except ImportError as e:
+        print(_fail(f"VitAITactileCamera 导入失败: {e}"))
+        return False
+
+    tactile = VitAITactileCamera(serial_left=serial_left, serial_right=serial_right)
+    try:
+        print(f"   连接 GF225 left={serial_left}, right={serial_right} ...")
+        if not tactile.connect():
+            print(_fail("触觉传感器连接或校准失败"))
+            return False
+        images = tactile.get_images()
+        ok = True
+        for key in (constants.IMAGE_KEY_TACTILE_LEFT, constants.IMAGE_KEY_TACTILE_RIGHT):
+            img = images.get(key)
+            if img is None:
+                print(_fail(f"{key}  →  未返回图像"))
+                ok = False
+                continue
+            if img.ndim != 3 or img.shape[2] != 3:
+                print(_fail(f"{key}  →  图像形状异常: {img.shape}，期望 H×W×3"))
+                ok = False
+                continue
+            if img.dtype != np.uint8:
+                print(_fail(f"{key}  →  图像 dtype 异常: {img.dtype}，期望 uint8"))
+                ok = False
+                continue
+            print(_ok(f"{key}  →  {img.shape[1]}×{img.shape[0]} RGB uint8"))
+        if ok:
+            print(_ok("VitAI GF225 触觉传感器检测通过"))
+        return ok
+    except Exception as e:
+        print(_fail(f"触觉传感器采集异常: {e}"))
+        return False
+    finally:
+        try:
+            tactile.disconnect()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 检测 6：UMI 示教设备（ROS 话题）
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_umi(
@@ -324,7 +380,7 @@ def check_umi(
     timeout_s: float = 5.0,
     domain_id: int = 9,
 ) -> bool:
-    print(_title("[4] UMI 示教设备（ROS 话题）"))
+    print(_title("[5] UMI 示教设备（ROS 话题）"))
     try:
         import rclpy
         import rclpy.context
@@ -409,6 +465,8 @@ def main():
                         help="跳过夹爪检测")
     parser.add_argument("--skip_cameras", action="store_true",
                         help="跳过相机检测")
+    parser.add_argument("--skip_tactile", action="store_true",
+                        help="跳过 VitAI GF225 触觉传感器检测")
     parser.add_argument("--ros_timeout",  default=8.0, type=float,
                         help="等待 ROS 话题的超时秒数（默认 8s）")
     parser.add_argument("--umi_domain_id", default=9, type=int,
@@ -417,10 +475,14 @@ def main():
                         help="正面 RealSense 序列号（默认读取 constants.py）")
     parser.add_argument("--cam_wrist_serial", default=constants.REALSENSE_WRIST_SERIAL,
                         help="腕部 RealSense 序列号（默认读取 constants.py；为空时自动选第二台）")
+    parser.add_argument("--tactile_sn_left", default=constants.TACTILE_LEFT_SERIAL,
+                        help="左触觉 VitAI GF225 序列号（默认读取 constants.py）")
+    parser.add_argument("--tactile_sn_right", default=constants.TACTILE_RIGHT_SERIAL,
+                        help="右触觉 VitAI GF225 序列号（默认读取 constants.py）")
     args = parser.parse_args()
 
     print(f"\n{'='*60}")
-    print(f"  越疆 Dobot / 知行夹爪 / RealSense / UMI  硬件连通性检测")
+    print(f"  越疆 Dobot / 知行夹爪 / RealSense / VitAI 触觉 / UMI  硬件连通性检测")
     print(f"{'='*60}")
 
     results: dict[str, bool | None] = {}
@@ -463,7 +525,18 @@ def main():
         print(_warn("已跳过（--skip_cameras）"))
         results["cameras"] = None
 
-    # 5. UMI
+    # 5. 触觉传感器
+    if not args.skip_tactile:
+        results["tactile"] = check_tactile(
+            serial_left=args.tactile_sn_left,
+            serial_right=args.tactile_sn_right,
+        )
+    else:
+        print(_title("[4] VitAI GF225 触觉传感器"))
+        print(_warn("已跳过（--skip_tactile）"))
+        results["tactile"] = None
+
+    # 6. UMI
     if not args.skip_umi:
         results["umi"] = check_umi(
             constants.UMI_VIO_POSE_TOPIC,
@@ -471,7 +544,7 @@ def main():
             domain_id=args.umi_domain_id,
         )
     else:
-        print(_title("[4] UMI 示教设备"))
+        print(_title("[5] UMI 示教设备"))
         print(_warn("已跳过（--skip_umi）"))
         results["umi"] = None
 
@@ -483,6 +556,7 @@ def main():
         "arm":     "越疆机械臂",
         "gripper": "知行夹爪  ",
         "cameras": "RealSense ",
+        "tactile": "VitAI触觉 ",
         "umi":     "UMI 设备  ",
     }
     all_pass = True

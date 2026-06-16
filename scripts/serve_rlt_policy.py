@@ -379,17 +379,26 @@ def main(args: Args) -> None:
             "action_dim": ACTION_DIM,
             "supports_batch": True,
             "shared_prefix_inference": args.shared_prefix_inference,
+            "use_tactile": bool(getattr(config.model, "use_tactile", False)),
         },
     )
 
     # Test single inference
     logging.info("Testing single inference...")
-    # Use data-level keys that vitai_policy.infer() expects (cam_front, cam_wrist)
+    # Use data-level keys that vitai_policy.infer() expects.
+    fake_images = {
+        "cam_front": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
+    }
+    if getattr(config.model, "use_tactile", False):
+        fake_images.update(
+            {
+                "tactile_left": np.zeros((224, 224, 3), dtype=np.uint8),
+                "tactile_right": np.zeros((224, 224, 3), dtype=np.uint8),
+            }
+        )
     fake_dict = {
-        "images": {
-            "cam_front": np.zeros((224, 224, 3), dtype=np.uint8),
-            "cam_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
-        },
+        "images": fake_images,
         "state": np.zeros(PROPRIO_DIM, dtype=np.float32),
         "prompt": "test prompt",
     }

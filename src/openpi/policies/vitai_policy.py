@@ -48,6 +48,9 @@ class ViTaiInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType = _model.ModelType.PI0
 
+    # Whether tactile_left/tactile_right are required and forwarded to the model.
+    use_tactile: bool = False
+
     def __call__(self, data: dict) -> dict:
         state = transforms.pad_to_dim(data["state"], self.action_dim)
         
@@ -59,13 +62,21 @@ class ViTaiInputs(transforms.DataTransformFn):
         
         image_masks = {key: np.True_ for key in images}
         
-        # Add tactile sensors if all are present
-        # 新数据集 key: tactile_left, tactile_right
-        tactile_keys = ["tactile_left", "tactile_right"]
-        if all(key in data["images"] for key in tactile_keys):
-            for key in tactile_keys:
-                images[key] = _parse_image(data["images"][key])
-                image_masks[key] = np.True_
+        # 新数据集 key: tactile_left/tactile_right；模型内部 key: left1/left2_tactile_rgb。
+        tactile_map = {
+            "tactile_left": "left1_tactile_rgb",
+            "tactile_right": "left2_tactile_rgb",
+        }
+        has_all_tactile = all(key in data["images"] for key in tactile_map)
+        if self.use_tactile and not has_all_tactile:
+            raise ValueError(
+                "ViTai tactile mode enabled but observation images are missing "
+                f"{sorted(tactile_map)}; got {sorted(data['images'])}"
+            )
+        if self.use_tactile:
+            for source_key, model_key in tactile_map.items():
+                images[model_key] = _parse_image(data["images"][source_key])
+                image_masks[model_key] = np.True_
         
         inputs = {"state": state, "image": images, "image_mask": image_masks}
         

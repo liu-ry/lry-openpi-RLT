@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import List, Optional
 
 import einops
@@ -50,6 +51,8 @@ class DobotUMIEnvironment(_environment.Environment):
         gripper_ctrl_topic: str = constants.GRIPPER_CTRL_TOPIC,
         enable_gripper_stream: bool = True,
         obs_ready_timeout_s: float | None = 10.0,
+        enable_tactile: bool = False,
+        tactile_image_provider: Callable[[], dict[str, np.ndarray]] | None = None,
     ) -> None:
         self._env = _real_env.make_real_env(
             reset_joint_positions=reset_joint_positions,
@@ -57,6 +60,8 @@ class DobotUMIEnvironment(_environment.Environment):
             cam_front_serial=cam_front_serial,
             cam_wrist_serial=cam_wrist_serial,
             obs_ready_timeout_s=obs_ready_timeout_s,
+            enable_tactile=enable_tactile,
+            tactile_image_provider=tactile_image_provider,
         )
         self._render_height = render_height
         self._render_width = render_width

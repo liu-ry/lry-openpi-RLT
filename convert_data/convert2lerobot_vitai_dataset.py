@@ -84,7 +84,8 @@ def get_action_from_state_pos(state_pos):
 
 def main(root_dir: str = "/home/lry/temp/sync", 
         output_dir: str = "/home/lry/temp/lerobot_output",
-        single_dir: bool = False):
+        single_dir: bool = False,
+        include_tactile: bool = False):
     error_num = 0
     succ_num = 0
     output_path = Path(output_dir)
@@ -119,35 +120,44 @@ def main(root_dir: str = "/home/lry/temp/sync",
     STATE_DIM = JOINT_DIM + 1   # 6 (joint) + 1 (gripper) = 7
     state_names = [f"joint_{i}" for i in range(JOINT_DIM)] + ["gripper"]
 
+    image_features = {
+        # 前视 RGB 相机
+        "observation.images.cam_front": {
+            "dtype": "image",
+            "shape": (480, 640, 3),
+            "names": ["height", "width", "channel"],
+        },
+        # 腕部 RGB 相机
+        "observation.images.cam_wrist": {
+            "dtype": "image",
+            "shape": (480, 640, 3),
+            "names": ["height", "width", "channel"],
+        },
+    }
+    if include_tactile:
+        image_features.update(
+            {
+                # 左触觉图像
+                "observation.images.tactile_left": {
+                    "dtype": "image",
+                    "shape": (240, 240, 3),
+                    "names": ["height", "width", "channel"],
+                },
+                # 右触觉图像
+                "observation.images.tactile_right": {
+                    "dtype": "image",
+                    "shape": (240, 240, 3),
+                    "names": ["height", "width", "channel"],
+                },
+            }
+        )
+
     dataset = LeRobotDataset.create(
         repo_id=output_dir,
         robot_type="vitai",
         fps=30,
         features={
-            # 前视 RGB 相机
-            "observation.images.cam_front": {
-                "dtype": "image",
-                "shape": (480, 640, 3),
-                "names": ["height", "width", "channel"],
-            },
-            # 腕部 RGB 相机
-            "observation.images.cam_wrist": {
-                "dtype": "image",
-                "shape": (480, 640, 3),
-                "names": ["height", "width", "channel"],
-            },
-            # 左触觉图像
-            "observation.images.tactile_left": {
-                "dtype": "image",
-                "shape": (240, 240, 3),
-                "names": ["height", "width", "channel"],
-            },
-            # 右触觉图像
-            "observation.images.tactile_right": {
-                "dtype": "image",
-                "shape": (240, 240, 3),
-                "names": ["height", "width", "channel"],
-            },
+            **image_features,
             # 机器人状态：关节位置前6维 + 夹爪 (1) = 7 维
             "observation.state": {
                 "dtype": "float32",
@@ -239,10 +249,12 @@ def main(root_dir: str = "/home/lry/temp/sync",
                     "observation.images.cam_front": "realsense_top_rgb.mp4",
                     "observation.images.cam_wrist":  "realsense_wrist_rgb.mp4",
                 }
-                tactile_video_files = {
-                    "observation.images.tactile_left":  ["tactile_left.mp4", "tactile_left_warped_image.mp4"],
-                    "observation.images.tactile_right": ["tactile_right.mp4", "tactile_right_warped_image.mp4"],
-                }
+                tactile_video_files = {}
+                if include_tactile:
+                    tactile_video_files = {
+                        "observation.images.tactile_left":  ["tactile_left.mp4", "tactile_left_warped_image.mp4"],
+                        "observation.images.tactile_right": ["tactile_right.mp4", "tactile_right_warped_image.mp4"],
+                    }
 
                 video_frames = {}
                 for key, filename in video_files.items():
@@ -261,9 +273,14 @@ def main(root_dir: str = "/home/lry/temp/sync",
                     len(timestamps),
                     len(video_frames["observation.images.cam_front"]),
                     len(video_frames["observation.images.cam_wrist"]),
-                    len(video_frames["observation.images.tactile_left"]),
-                    len(video_frames["observation.images.tactile_right"]),
                 ]
+                if include_tactile:
+                    lengths.extend(
+                        [
+                            len(video_frames["observation.images.tactile_left"]),
+                            len(video_frames["observation.images.tactile_right"]),
+                        ]
+                    )
                 if len(set(lengths)) > 1:
                     print(f"警告: 数据长度不一致 {lengths}，跳过此episode")
                     continue
@@ -274,12 +291,21 @@ def main(root_dir: str = "/home/lry/temp/sync",
                     frame_data = {
                         "observation.images.cam_front":  video_frames["observation.images.cam_front"][step_idx],
                         "observation.images.cam_wrist":  video_frames["observation.images.cam_wrist"][step_idx],
-                        "observation.images.tactile_left":  video_frames["observation.images.tactile_left"][step_idx],
-                        "observation.images.tactile_right": video_frames["observation.images.tactile_right"][step_idx],
                         "observation.state": state_pos[step_idx],
                         "actions":           actions[step_idx],
                         "task":              default_task,
                     }
+                    if include_tactile:
+                        frame_data.update(
+                            {
+                                "observation.images.tactile_left": video_frames[
+                                    "observation.images.tactile_left"
+                                ][step_idx],
+                                "observation.images.tactile_right": video_frames[
+                                    "observation.images.tactile_right"
+                                ][step_idx],
+                            }
+                        )
                     dataset.add_frame(frame_data)
 
                 # 保存当前episode

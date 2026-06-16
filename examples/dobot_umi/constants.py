@@ -54,6 +54,12 @@ REALSENSE_HEIGHT        = 480
 REALSENSE_FPS           = 30
 
 # ─────────────────────────────────────────────────────────────
+# VitAI GF225 触觉传感器（pyvitaisdk）
+# ─────────────────────────────────────────────────────────────
+TACTILE_LEFT_SERIAL     = "GF22511615AAF"
+TACTILE_RIGHT_SERIAL    = "GF22513812AF6"
+
+# ─────────────────────────────────────────────────────────────
 # ROS 话题名称（仅 UMI 设备走 ROS；相机已改为 SDK 直驱）
 # ─────────────────────────────────────────────────────────────
 # RealSense 相机话题（保留，供需要 ROS 桥接的场景使用）
@@ -74,3 +80,5 @@ UMI_TELEOP_TRIGGER_SERVICE = "/umi/teleop_trigger"
 # ─────────────────────────────────────────────────────────────
 IMAGE_KEY_FRONT = "cam_front"
 IMAGE_KEY_WRIST = "cam_wrist"
+IMAGE_KEY_TACTILE_LEFT = "tactile_left"
+IMAGE_KEY_TACTILE_RIGHT = "tactile_right"

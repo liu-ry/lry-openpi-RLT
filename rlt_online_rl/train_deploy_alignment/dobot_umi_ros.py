@@ -72,13 +72,16 @@ if str(_REPO_ROOT_OUTER) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT_OUTER))
 
 try:
-    from examples.dobot_umi.robot_utils import RealSenseImageRecorder  # type: ignore[import]
+    from examples.dobot_umi import constants as dobot_umi_constants  # type: ignore[import]
+    from examples.dobot_umi.robot_utils import RealSenseImageRecorder, VitAITactileCamera  # type: ignore[import]
     _HAS_REALSENSE_RECORDER = True
 except ImportError as _e_realsense:
     import traceback as _tb
     _tb.print_exc()
     _HAS_REALSENSE_RECORDER = False
+    dobot_umi_constants = None  # type: ignore[assignment]
     RealSenseImageRecorder = None  # type: ignore[assignment,misc]
+    VitAITactileCamera = None  # type: ignore[assignment,misc]
 
 try:
     from dobot_api import DobotApiDashboard, DobotApiFeedBack  # type: ignore[import]
@@ -270,6 +273,13 @@ def _gripper_m_to_travel(value: float, *, max_gripper_m: float = GRIPPER_MAX_M) 
     opening_m = float(np.clip(value, 0.0, max_gripper_m))
     ratio_closed = 1.0 - opening_m / max(float(max_gripper_m), 1e-6)
     return float(np.clip(ratio_closed * DEFAULT_GRIPPER_POS_CLOSE, 0.0, DEFAULT_GRIPPER_POS_CLOSE))
+
+
+def _zero_tactile_images() -> dict[str, np.ndarray]:
+    return {
+        "tactile_left": np.zeros((240, 240, 3), dtype=np.uint8),
+        "tactile_right": np.zeros((240, 240, 3), dtype=np.uint8),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1266,8 +1276,9 @@ class DobotUMIRobotBridge:
         return {
             "state": state7,
             "images": {
-                "cam_front": images["cam_front"],
-                "cam_wrist": images["cam_wrist"],
+                key: images[key]
+                for key in ("cam_front", "cam_wrist", "tactile_left", "tactile_right")
+                if key in images
             },
             "prompt": task,
         }
@@ -1658,6 +1669,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--realsense_width", type=int, default=640)
     parser.add_argument("--realsense_height", type=int, default=480)
     parser.add_argument("--realsense_fps", type=int, default=30)
+    parser.add_argument(
+        "--tactile_image_provider_factory",
+        type=str,
+        default=None,
+        help=(
+            "高级覆盖：触觉图像 provider 工厂，格式 module:function。工厂应返回一个无参 callable，"
+            "每次调用返回 {'tactile_left': HWC uint8, 'tactile_right': HWC uint8}。"
+        ),
+    )
+    parser.add_argument(
+        "--tactile_sn_left",
+        type=str,
+        default=dobot_umi_constants.TACTILE_LEFT_SERIAL if dobot_umi_constants is not None else "",
+        help="VitAI GF225 左触觉传感器序列号；置空则不启用 SDK 触觉采集。",
+    )
+    parser.add_argument(
+        "--tactile_sn_right",
+        type=str,
+        default=dobot_umi_constants.TACTILE_RIGHT_SERIAL if dobot_umi_constants is not None else "",
+        help="VitAI GF225 右触觉传感器序列号；置空则不启用 SDK 触觉采集。",
+    )
+    parser.add_argument(
+        "--allow_missing_tactile",
+        action="store_true",
+        help="触觉 SN 已配置但连接失败时继续运行，仅用于调试旧双相机策略。",
+    )
+    parser.add_argument(
+        "--enable_tactile",
+        action="store_true",
+        help="启用 VitAI GF225 SDK 触觉采集。未设置时即使配置了触觉 SN 也不会连接触觉传感器。",
+    )
 
     # ── 知行夹爪 SDK（RS-485） ────────────────────────────────────────────────
     parser.add_argument("--gripper_port", type=str, default=DEFAULT_GRIPPER_PORT)
@@ -1779,6 +1821,28 @@ def main() -> None:
     success_fn    = _load_callable(args.success_factory)    or _default_success_fn
     done_fn       = _load_callable(args.done_factory)       or _default_done_fn
     safe_action_filter = _load_callable(args.safe_action_filter_factory)
+    tactile_camera = None
+    tactile_image_provider = None
+    if args.tactile_image_provider_factory:
+        tactile_factory = _load_callable(args.tactile_image_provider_factory)
+        if tactile_factory is None:
+            raise ValueError(f"无法加载触觉图像 provider 工厂: {args.tactile_image_provider_factory}")
+        tactile_image_provider = tactile_factory()
+    elif args.enable_tactile and args.tactile_sn_left and args.tactile_sn_right:
+        if VitAITactileCamera is None:
+            raise ImportError("VitAITactileCamera 不可用，请确认 examples/dobot_umi/robot_utils.py 可导入")
+        tactile_camera = VitAITactileCamera(
+            serial_left=args.tactile_sn_left,
+            serial_right=args.tactile_sn_right,
+        )
+        if tactile_camera.connect():
+            tactile_image_provider = tactile_camera.get_images
+        elif args.allow_missing_tactile:
+            logger.warning("触觉传感器连接失败，因 --allow_missing_tactile 继续以全零触觉图像运行")
+            tactile_camera = None
+            tactile_image_provider = _zero_tactile_images
+        else:
+            raise RuntimeError("触觉传感器连接失败；若要调试旧双相机策略，请显式传 --allow_missing_tactile")
 
     task_state         = TaskState(args.task)
     intervention_state = HumanInterventionState(policy_enabled=not args.start_in_human_mode)
@@ -1796,6 +1860,8 @@ def main() -> None:
         width=args.realsense_width,
         height=args.realsense_height,
         fps=args.realsense_fps,
+        enable_tactile=tactile_image_provider is not None,
+        tactile_image_provider=tactile_image_provider,
     )
     cam_recorder.start()
 
@@ -1969,6 +2035,11 @@ def main() -> None:
             cam_recorder.stop()
         except Exception:
             pass
+        if tactile_camera is not None:
+            try:
+                tactile_camera.disconnect()
+            except Exception:
+                pass
         executor.shutdown()
         for node in nodes:
             try:

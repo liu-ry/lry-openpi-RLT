@@ -23,6 +23,16 @@ from openpi_client.runtime.agents import policy_agent as _policy_agent
 
 from examples.dobot_umi import constants
 from examples.dobot_umi import env as _env
+from examples.dobot_umi import robot_utils as _utils
+
+
+def _zero_tactile_images() -> dict[str, object]:
+    import numpy as np
+
+    return {
+        constants.IMAGE_KEY_TACTILE_LEFT: np.zeros((240, 240, 3), dtype=np.uint8),
+        constants.IMAGE_KEY_TACTILE_RIGHT: np.zeros((240, 240, 3), dtype=np.uint8),
+    }
 
 
 @dataclasses.dataclass
@@ -50,6 +60,9 @@ class Args:
     joint_cmd_topic: str = constants.JOINT_CMD_TOPIC
     gripper_ctrl_topic: str = constants.GRIPPER_CTRL_TOPIC
     enable_gripper_stream: bool = True
+    tactile_sn_left: str = constants.TACTILE_LEFT_SERIAL
+    tactile_sn_right: str = constants.TACTILE_RIGHT_SERIAL
+    allow_missing_tactile: bool = False
 
 
 def main(args: Args) -> None:
@@ -59,6 +72,23 @@ def main(args: Args) -> None:
     )
     logging.info("策略服务器元数据: %s", ws_client_policy.get_server_metadata())
     metadata = ws_client_policy.get_server_metadata()
+    tactile_camera = None
+    tactile_image_provider = None
+    if metadata.get("use_tactile", False):
+        if not args.tactile_sn_left or not args.tactile_sn_right:
+            raise ValueError("策略需要触觉模态，但 tactile_sn_left/right 未配置")
+        tactile_camera = _utils.VitAITactileCamera(
+            serial_left=args.tactile_sn_left,
+            serial_right=args.tactile_sn_right,
+        )
+        if tactile_camera.connect():
+            tactile_image_provider = tactile_camera.get_images
+        elif args.allow_missing_tactile:
+            logging.warning("触觉传感器连接失败，因 allow_missing_tactile 继续以全零触觉图像运行")
+            tactile_camera = None
+            tactile_image_provider = _zero_tactile_images
+        else:
+            raise RuntimeError("策略需要触觉模态，但触觉传感器连接失败")
 
     environment = _env.DobotUMIEnvironment(
         reset_joint_positions=metadata.get("reset_pose"),
@@ -70,6 +100,8 @@ def main(args: Args) -> None:
         joint_cmd_topic=args.joint_cmd_topic,
         gripper_ctrl_topic=args.gripper_ctrl_topic,
         enable_gripper_stream=args.enable_gripper_stream,
+        enable_tactile=tactile_image_provider is not None,
+        tactile_image_provider=tactile_image_provider,
     )
 
     runtime = _runtime.Runtime(
@@ -86,7 +118,11 @@ def main(args: Args) -> None:
         max_episode_steps=args.max_episode_steps,
     )
 
-    runtime.run()
+    try:
+        runtime.run()
+    finally:
+        if tactile_camera is not None:
+            tactile_camera.disconnect()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,11 @@ IMAGE_KEYS = (
     "right_wrist_0_rgb",
 )
 
+TACTILE_KEYS = (
+    "left1_tactile_rgb",
+    "left2_tactile_rgb",
+)
+
 IMAGE_RESOLUTION = (224, 224)
 
 
@@ -23,11 +28,16 @@ def preprocess_observation_pytorch(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    use_tactile: bool = False,
 ):
     """Torch.compile-compatible version of preprocess_observation_pytorch with simplified type annotations.
 
     This function avoids complex type annotations that can cause torch.compile issues.
     """
+    image_keys = list(image_keys)
+    if use_tactile:
+        image_keys.extend(TACTILE_KEYS)
+
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
@@ -54,7 +64,7 @@ def preprocess_observation_pytorch(
             image = image / 2.0 + 0.5
 
             # Apply PyTorch-based augmentations
-            if "wrist" not in key:
+            if "wrist" not in key and "tactile" not in key:
                 # Geometric augmentations for non-wrist cameras
                 height, width = image.shape[1:3]
 
