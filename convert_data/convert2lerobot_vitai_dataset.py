@@ -1,3 +1,39 @@
+"""
+将原始 Vitai 采集数据转换为 LeRobot 数据集。
+
+使用方法:
+    uv run --no-sync convert_data/convert2lerobot_vitai_dataset.py \
+        --root-dir /path/to/sync \
+        --output-dir /path/to/lerobot_output
+
+常用示例:
+    1. 转换 `root_dir` 下所有子目录中的 episode:
+       uv run --no-sync convert_data/convert2lerobot_vitai_dataset.py \
+           --root-dir /home/lry/temp/sync \
+           --output-dir /home/lry/temp/lerobot_output
+
+    2. `root_dir` 本身就是单个数据目录时:
+       uv run --no-sync convert_data/convert2lerobot_vitai_dataset.py \
+           --root-dir /path/to/one_run \
+           --output-dir /path/to/lerobot_output \
+           --single-dir
+
+    3. 同时导出触觉视频:
+       uv run --no-sync convert_data/convert2lerobot_vitai_dataset.py \
+           --root-dir /path/to/sync \
+           --output-dir /path/to/lerobot_output \
+           --include-tactile
+
+输入目录约定:
+    - 默认情况下，`root_dir` 下每个子目录都会被遍历，并在其中查找 `episode_*`
+    - `--single-dir` 开启后，直接把 `root_dir` 当作单个数据目录处理
+    - 每个 episode 目录内至少应包含:
+      `robot_joint.npy`(或 `robot_joint_velocity_force.npy`)、`gripper.npy`、
+      `timestamps.npy`、`realsense_top_rgb.mp4`、`realsense_wrist_rgb.mp4`
+    - 元数据文件支持 `metadata.json` 或 `meta.json`
+    - 开启 `--include-tactile` 时，还需要触觉视频文件
+"""
+
 import os
 import shutil
 import json

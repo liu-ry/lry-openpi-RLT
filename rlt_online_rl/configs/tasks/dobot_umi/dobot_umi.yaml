@@ -74,8 +74,15 @@ runtime:
     machine_a_ws_url: ws://192.168.3.5:8099
     actor_service_url: http://127.0.0.1:9101
     replay_service_url: http://127.0.0.1:9102
-    task_mode: critical_phase
+    # Full Ethernet insertion consists of approach -> grasp cable -> move to port -> insert.
+    # Keep the non-contact prefix under the frozen VLA/base ref_chunk. Press `c`
+    # from the keyboard control once the cable is aligned at the port to enter
+    # the critical insertion phase where the RLT actor is allowed to refine.
+    task_mode: full_task
     episode_start_control_mode: policy
+    # full_task_reset_action should be the safe start pose before approaching the cable.
+    # critical_phase_reset_action is only used when task_mode is switched back to
+    # critical_phase for short insertion-only debugging/evaluation.
     full_task_reset_action: [0.00647517, -0.01509710, 0.02923426, 0.00956440, 0.09037315, 0.01089085, 0.09599978]
     critical_phase_reset_action: [0.18784978739210226, 1.2123580583125149, -0.9000662952532484, 0.2818183143194532, -0.18111281647940586, -0.31895892080188315, 0.00470703858137131]
     actor_deterministic: false

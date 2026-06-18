@@ -8,7 +8,6 @@ import rclpy
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 from train_deploy_alignment.manual_signal_bridge import APPROVE_ONLINE_SERVICE
-from train_deploy_alignment.manual_signal_bridge import ENTER_CRITICAL_PHASE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_FAILURE_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_0_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_1_SERVICE
@@ -16,6 +15,7 @@ from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_2_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_SCORE_3_SERVICE
 from train_deploy_alignment.manual_signal_bridge import RECORD_SUCCESS_SERVICE
 from train_deploy_alignment.manual_signal_bridge import REQUEST_NEXT_EPISODE_SERVICE
+from train_deploy_alignment.manual_signal_bridge import TOGGLE_CRITICAL_PHASE_SERVICE
 
 RL_TELEOP_TRIGGER_SERVICE_DEFAULT = "/umi/teleop_trigger"
 HW_TELEOP_TRIGGER_SERVICE_DEFAULT = "/umi/teleop_trigger"
@@ -63,7 +63,7 @@ class KeyboardTeleopRecordRewardToggle(Node):
         self.score1_cli = self.create_client(Trigger, RECORD_SCORE_1_SERVICE)
         self.score2_cli = self.create_client(Trigger, RECORD_SCORE_2_SERVICE)
         self.score3_cli = self.create_client(Trigger, RECORD_SCORE_3_SERVICE)
-        self.critical_phase_cli = self.create_client(Trigger, ENTER_CRITICAL_PHASE_SERVICE)
+        self.critical_phase_cli = self.create_client(Trigger, TOGGLE_CRITICAL_PHASE_SERVICE)
         self.online_approval_cli = self.create_client(Trigger, APPROVE_ONLINE_SERVICE)
         self.control_mode = "unknown"
 
@@ -94,7 +94,7 @@ class KeyboardTeleopRecordRewardToggle(Node):
             "Ready. Press 't' to toggle teleop. Press 'o' to start the next episode. "
             "Press 's' to end the episode with legacy success(=3). Press 'f' to end the episode with failure(=0). "
             "Press '0'/'1'/'2'/'3' to record graded terminal scores. "
-            "Press 'c' to enter the critical phase. Press Enter to approve warmup->RL switch. Press 'q' to quit."
+            "Press 'c' to toggle the critical phase. Press Enter to approve warmup->RL switch. Press 'q' to quit."
         )
 
     @staticmethod
@@ -265,14 +265,14 @@ class KeyboardTeleopRecordRewardToggle(Node):
         clamped_score = max(0, min(int(score), 3))
         self._record_terminal(clients[clamped_score], f"score={clamped_score}")
 
-    def enter_critical_phase(self):
-        resp = self._call_trigger(self.critical_phase_cli, "Failed to enter the critical phase.")
+    def toggle_critical_phase(self):
+        resp = self._call_trigger(self.critical_phase_cli, "Failed to toggle the critical phase.")
         if resp is None:
             return
         if resp.success:
-            self.get_logger().info(resp.message if resp.message else "Entered the critical phase.")
+            self.get_logger().info(resp.message if resp.message else "Toggled the critical phase.")
             return
-        self.get_logger().warn(resp.message if resp.message else "Entering the critical phase failed.")
+        self.get_logger().warn(resp.message if resp.message else "Toggling the critical phase failed.")
 
     def approve_online_transition(self):
         resp = self._call_trigger(self.online_approval_cli, "Failed to approve online transition.")
@@ -308,7 +308,7 @@ def main():
             elif ch in ("0", "1", "2", "3"):
                 node.record_score(int(ch))
             elif ch == "c":
-                node.enter_critical_phase()
+                node.toggle_critical_phase()
             elif ch in ("\r", "\n"):
                 node.approve_online_transition()
     except KeyboardInterrupt:
