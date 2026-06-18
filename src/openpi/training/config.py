@@ -1200,10 +1200,11 @@ _CONFIGS = [
     
     
     
-    
+    ##############  VT config ##############
     #
     # Fine-tuning ViTai configs.
     #
+    # 1.dobot 的圆形3D打印件插拔
     TrainConfig(
         name="pi05_vitai_lora_finetune_0604",
         model=pi0_config.Pi0Config(
@@ -1299,6 +1300,199 @@ _CONFIGS = [
         rlt_embed_dim=2048,
         rlt_input_dim=2048,
     ),
+    # 2.dobot 的网口插拔无触觉
+    TrainConfig(
+        name="pi05_vitai_lora_finetune_without_tactile_0616",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotViTaiDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616/assets",
+            ),
+            default_prompt="Unplug the Ethernet cable and insert it into the Ethernet port",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_front": "observation.images.cam_front",
+                                "cam_wrist": "observation.images.cam_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+        num_train_steps=100_000,
+        batch_size=16,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        keep_period=5000,
+        wandb_enabled=True,
+        num_workers=4,
+    ),
+    #
+    # RLT (Representation Learning Token) configs.
+    #
+    TrainConfig(
+        name="rlt_pi05_vitai_lora_without_tactile_0616",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotViTaiDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616/assets",
+            ),
+            default_prompt="Unplug the Ethernet cable and insert it into the Ethernet port",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_front": "observation.images.cam_front",
+                                "cam_wrist": "observation.images.cam_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/liury/src/lry-openpi-RLT/checkpoints/pi05_vitai_lora_finetune_without_tactile_0616/pi05_vitai_lora_finetune_without_tactile_0616_1/99999/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=8,
+        keep_period=2000,
+        wandb_enabled=True,
+        # Stage1：VLA 完全冻结，只训练 rlt_module
+        rlt_alpha=0.0,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+    ),
+    # 3.dobot 的网口插拔有触觉
+    TrainConfig(
+        name="pi05_vitai_lora_finetune_with_tactile_0616",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=True,
+        ),
+        data=LeRobotViTaiDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616/assets",
+            ),
+            default_prompt="Unplug the Ethernet cable and insert it into the Ethernet port",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_front": "observation.images.cam_front",
+                                "cam_wrist": "observation.images.cam_wrist",
+                                "tactile_left": "observation.images.tactile_left",
+                                "tactile_right": "observation.images.tactile_right",                                
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        keep_period=3000,
+        wandb_enabled=True,
+        num_workers=4,
+        # resume=True
+    ),
+    #
+    # RLT (Representation Learning Token) configs.
+    #
+    TrainConfig(
+        name="rlt_pi05_vitai_lora_with_tactile_0616",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=True,
+        ),
+        data=LeRobotViTaiDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/dobot_ethernet_cable_insert_0616/assets",
+            ),
+            default_prompt="Unplug the Ethernet cable and insert it into the Ethernet port",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_front": "observation.images.cam_front",
+                                "cam_wrist": "observation.images.cam_wrist",
+                                "tactile_left": "observation.images.tactile_left",
+                                "tactile_right": "observation.images.tactile_right",                                
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/liury/src/lry-openpi-RLT/checkpoints/pi05_vitai_lora_finetune_with_tactile_0616/pi05_vitai_lora_finetune_with_tactile_0616_2_multiGPU/24000/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=8,
+        keep_period=2000,
+        wandb_enabled=True,
+        # Stage1：VLA 完全冻结，只训练 rlt_module
+        rlt_alpha=0.0,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+    ),
+    ##############  VT config ##############
+    
+    
+    
     TrainConfig(
         name="debug_rlt",
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
