@@ -448,7 +448,7 @@ class ZhixingSDKGripper:
     """知行夹爪 SDK 直驱控制器（RS-485 串口，MotorController）。
 
     Args:
-        port:       串口设备节点（默认 /dev/ttyUSB0）
+        port:       串口设备节点（默认 /dev/ttyUSB1）
         slave_id:   Modbus 从机 ID（默认 1）
         baudrate:   波特率（默认 115200）
         speed_pct:  运动速度百分比（1–100）

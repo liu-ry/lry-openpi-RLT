@@ -27,7 +27,7 @@
 | 硬件 | 连接方式 | 默认地址/设备 |
 |------|----------|--------------|
 | Dobot 机械臂 | 以太网 TCP/IP | `192.168.5.1` dashboard `:29999` / feedback `:30004` |
-| 知行夹爪 | RS-485 串口 | `/dev/ttyUSB0` baud=115200 |
+| 知行夹爪 | RS-485 串口 | `/dev/ttyUSB1` baud=115200 |
 | RealSense 正面相机 | USB3 → ROS | `/cam_front/color/image_raw` |
 | RealSense 腕部相机 | USB3 → ROS | `/cam_wrist/color/image_raw` |
 | UMI 示教设备 | ROS 话题（可选） | `/umi1/vio/pose` |
@@ -66,7 +66,7 @@ ip addr show
 
 # 夹爪串口权限
 ls -la /dev/ttyUSB*
-sudo chmod 666 /dev/ttyUSB0
+sudo chmod 666 /dev/ttyUSB1
 # 或加入 dialout 组（重登生效）
 sudo usermod -aG dialout $USER
 
@@ -84,7 +84,7 @@ ros2 topic echo /umi1/vio/pose --once
 
 ```python
 DOBOT_IP            = "192.168.5.1"   # ← 改为你的实际 IP
-GRIPPER_SERIAL_PORT = "/dev/ttyUSB0"  # ← 改为你的实际串口
+GRIPPER_SERIAL_PORT = "/dev/ttyUSB1"  # ← 改为你的实际串口
 ```
 
 ---

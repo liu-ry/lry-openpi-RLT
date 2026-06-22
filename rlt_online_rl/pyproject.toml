@@ -28,6 +28,9 @@ monitor = [
 robot = [
     "rclpy",
 ]
+phase-gate = [
+    "torch>=2.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]

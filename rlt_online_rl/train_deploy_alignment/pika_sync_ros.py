@@ -77,6 +77,8 @@ from openpi_client import image_tools
 
 from rlt_online_rl.config import OnlineRLSystemConfig
 from rlt_online_rl.config import load_system_config_yaml
+from rlt_online_rl.critical_phase_gate import OnlineCriticalPhaseGate
+from rlt_online_rl.critical_phase_gate import _TorchUnavailableError
 from rlt_online_rl.inference import ActorClient
 from rlt_online_rl.inference import ActorResponse
 from rlt_online_rl.inference import ChunkFeatures
@@ -231,6 +233,14 @@ class RolloutRuntimeContext:
             self.signal_values[SIGNAL_CRITICAL_STARTED] = active
             self._condition.notify_all()
             return active
+
+    def set_critical_phase(self, active: bool) -> bool:
+        with self._condition:
+            active = bool(active)
+            changed = bool(self.signal_values.get(SIGNAL_CRITICAL_STARTED, False)) != active
+            self.signal_values[SIGNAL_CRITICAL_STARTED] = active
+            self._condition.notify_all()
+            return changed
 
 
 class RolloutPhaseController:
@@ -1169,6 +1179,8 @@ class PikaChunkEnvAdapter:
             if limits.shape[0] != system.rl.action_dim:
                 raise ValueError(f"action_delta_limits must have {system.rl.action_dim} entries, got {limits.shape[0]}")
             self._action_delta_limits = limits
+        self._auto_critical_gate = self._create_auto_critical_gate()
+        self._last_observed_critical = self._runtime_context.in_critical_phase()
 
     def reset(self) -> dict[str, Any]:
         self._episode_chunk_step = 0
@@ -1188,11 +1200,111 @@ class PikaChunkEnvAdapter:
         locked_mode = self._runtime_context.lock_episode_critical_policy_mode()
         logger.info("Episode critical policy mode=%s", locked_mode)
         self._apply_episode_start_control_mode()
-        return self._robot.get_observation(self._resize_hw, self._task_state.get())
+        observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
+        self._last_observed_critical = self._runtime_context.in_critical_phase()
+        return observation
 
     def current_phase_name(self) -> str:
         segment = "critical" if self._runtime_context.in_critical_phase() else "base"
         return f"{self._phase_controller.episode_phase}:{self._task_mode}:{segment}"
+
+    def _create_auto_critical_gate(self) -> OnlineCriticalPhaseGate | None:
+        cfg = self._system.env_driver
+        if not bool(cfg.auto_critical_phase_enabled):
+            return None
+        if self._task_mode != "full_task":
+            logger.warning("Auto critical phase gate is ignored unless task_mode=full_task.")
+            return None
+        try:
+            gate = OnlineCriticalPhaseGate(
+                checkpoint_path=cfg.auto_critical_phase_checkpoint_path,
+                image_key=cfg.auto_critical_phase_image_key,
+                image_size=cfg.auto_critical_phase_image_size,
+                min_samples=cfg.auto_critical_phase_min_samples,
+                train_every_steps=cfg.auto_critical_phase_train_every_steps,
+                batch_size=cfg.auto_critical_phase_batch_size,
+                lr=cfg.auto_critical_phase_lr,
+                enter_threshold=cfg.auto_critical_phase_enter_threshold,
+                exit_threshold=cfg.auto_critical_phase_exit_threshold,
+            )
+        except _TorchUnavailableError as exc:
+            logger.warning("Auto critical phase gate disabled: %s", exc)
+            return None
+        logger.info(
+            "Auto critical phase gate enabled control=%s checkpoint=%s image_key=%s",
+            cfg.auto_critical_phase_control_enabled,
+            cfg.auto_critical_phase_checkpoint_path,
+            cfg.auto_critical_phase_image_key,
+        )
+        return gate
+
+    def _update_auto_critical_gate(self, observation: dict[str, Any], *, current_critical: bool) -> bool:
+        gate = self._auto_critical_gate
+        if gate is None:
+            self._last_observed_critical = bool(current_critical)
+            return bool(current_critical)
+
+        manual_changed = bool(current_critical) != bool(self._last_observed_critical)
+        auto_control = bool(self._system.env_driver.auto_critical_phase_control_enabled)
+
+        if manual_changed:
+            logger.info("Auto critical phase gate received manual correction label=%s", bool(current_critical))
+
+        desired = None
+        if auto_control and gate.ready:
+            desired = gate.desired_phase(observation, bool(current_critical))
+        if desired is not None:
+            desired_phase, prob = desired
+            if desired_phase != bool(current_critical):
+                changed = self._runtime_context.set_critical_phase(desired_phase)
+                if changed:
+                    logger.info(
+                        "Auto critical phase gate switched phase=%s prob=%.3f",
+                        "critical" if desired_phase else "base",
+                        prob,
+                    )
+                current_critical = desired_phase
+            else:
+                logger.debug("Auto critical phase gate kept phase=%s prob=%.3f", current_critical, prob)
+        self._last_observed_critical = bool(current_critical)
+        return bool(current_critical)
+
+    def _auto_critical_sample_indices(self, num_observations: int) -> list[int]:
+        if num_observations <= 0:
+            return []
+        frames = self._system.env_driver.auto_critical_phase_sample_frames
+        if not frames:
+            frames = ["first", "middle"]
+        indices: list[int] = []
+        for frame in frames:
+            token = str(frame).strip().lower()
+            if token == "first":
+                idx = 0
+            elif token in {"middle", "mid", "center"}:
+                idx = (num_observations - 1) // 2
+            elif token == "last":
+                idx = num_observations - 1
+            else:
+                try:
+                    idx = int(token)
+                except ValueError:
+                    logger.warning("Ignoring unknown auto critical phase sample frame %r", frame)
+                    continue
+                if idx < 0:
+                    idx = num_observations + idx
+            if 0 <= idx < num_observations and idx not in indices:
+                indices.append(idx)
+        return indices
+
+    def _record_auto_critical_samples(self, observations: list[dict[str, Any]], *, label: bool) -> None:
+        gate = self._auto_critical_gate
+        if gate is None:
+            return
+        auto_control = bool(self._system.env_driver.auto_critical_phase_control_enabled)
+        if auto_control:
+            return
+        for idx in self._auto_critical_sample_indices(len(observations)):
+            gate.observe_label(observations[idx], bool(label))
 
     def execute_chunk(
         self,
@@ -1202,11 +1314,14 @@ class PikaChunkEnvAdapter:
     ) -> tuple[dict[str, Any], list[float], bool, dict[str, Any]]:
         self._phase_controller.observe_progress()
         phase = self._phase_controller.episode_phase
-        critical_started = self._runtime_context.in_critical_phase()
         period = 1.0 / max(float(control_hz), 1e-6)
         horizon = int(self._system.env_driver.chunk_exec_horizon)
 
         observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
+        critical_started = self._update_auto_critical_gate(
+            observation,
+            current_critical=self._runtime_context.in_critical_phase(),
+        )
         executed: list[np.ndarray] = []
         ref_actions: list[np.ndarray] = []
         human_controlled: list[bool] = []
@@ -1279,6 +1394,7 @@ class PikaChunkEnvAdapter:
             if step_observations
             else self._robot.get_observation(self._resize_hw, self._task_state.get())
         )
+        self._record_auto_critical_samples(step_observations, label=critical_started)
         signal_snapshot = self._runtime_context.snapshot_signals()
         context = {
             "episode_chunk_step": self._episode_chunk_step,

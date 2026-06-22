@@ -126,6 +126,19 @@ class EnvDriverConfig:
     # UMI VIO 位姿 EMA 平滑系数（0 < alpha ≤ 1）：alpha=1 不平滑，越小越平滑但响应越慢。
     umi_smooth_alpha: float = 1.0
 
+    auto_critical_phase_enabled: bool = False
+    auto_critical_phase_control_enabled: bool = False
+    auto_critical_phase_checkpoint_path: str = "./artifacts/rlt/critical_phase_gate.pt"
+    auto_critical_phase_image_key: str = "wrist"
+    auto_critical_phase_image_size: int = 96
+    auto_critical_phase_sample_frames: list[str | int] = dataclasses.field(default_factory=lambda: ["first", "middle"])
+    auto_critical_phase_min_samples: int = 200
+    auto_critical_phase_train_every_steps: int = 20
+    auto_critical_phase_batch_size: int = 32
+    auto_critical_phase_lr: float = 3e-4
+    auto_critical_phase_enter_threshold: float = 0.75
+    auto_critical_phase_exit_threshold: float = 0.25
+
 
 @dataclasses.dataclass(frozen=True)
 class MonitoringConfig:

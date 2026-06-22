@@ -20,7 +20,7 @@
 | 设备 | 型号 / 接口 | 接入方式 |
 |------|------------|---------|
 | 机械臂 | 越疆 Dobot CR/MG 系列 | **SDK 直驱**（TCP/IP 以太网） |
-| 夹爪 | 知行电动夹爪 | **SDK 直驱**（RS-485 串口 `/dev/ttyUSB0`） |
+| 夹爪 | 知行电动夹爪 | **SDK 直驱**（RS-485 串口 `/dev/ttyUSB1`） |
 | 正面相机 | Intel RealSense D4xx | ROS 2 话题 `/cam_front/color/image_raw` |
 | 腕部相机 | Intel RealSense D4xx | ROS 2 话题 `/cam_wrist/color/image_raw` |
 | 示教设备 | UMI 遥操作手柄 | ROS 2 话题 `/umi/human_action` |
@@ -41,7 +41,7 @@
 │  ┌─────────▼───────────┐     ┌───────────────────────────────┐  │
 │  │  ZhixingSDKGripper  │     │  UMIHumanActionRecorder (ROS) │  │
 │  │  RS-485 串口直驱     │     │  订阅 /umi/human_action        │  │
-│  │  /dev/ttyUSB0       │     └───────────────────────────────┘  │
+│  │  /dev/ttyUSB1       │     └───────────────────────────────┘  │
 │  └─────────────────────┘                                         │
 └─────────────────────────────────────────────────────────────────┘
           SDK 直驱（无 ROS）          ROS 2 通信（相机 + UMI）
@@ -193,7 +193,7 @@ python rlt_online_rl/train_deploy_alignment/dobot_umi_ros.py \
     --config rlt_online_rl/configs/tasks/dobot_umi/online_rl.yaml \
     --dobot_ip 192.168.5.1 \
     --dobot_dashboard_port 29999 \
-    --gripper_port /dev/ttyUSB0 \
+    --gripper_port /dev/ttyUSB1 \
     --gripper_force_pct 50
 ```
 
@@ -208,7 +208,7 @@ python rlt_online_rl/train_deploy_alignment/dobot_umi_ros.py \
 | `DOBOT_IP` | `192.168.5.1` | 机械臂以太网 IP |
 | `DOBOT_DASHBOARD_PORT` | `29999` | 控制指令端口 |
 | `DOBOT_FEEDBACK_PORT` | `30004` | 反馈数据端口 |
-| `GRIPPER_SERIAL_PORT` | `/dev/ttyUSB0` | 夹爪串口设备节点 |
+| `GRIPPER_SERIAL_PORT` | `/dev/ttyUSB1` | 夹爪串口设备节点 |
 | `GRIPPER_SLAVE_ID` | `1` | Modbus 从机 ID |
 | `GRIPPER_BAUDRATE` | `115200` | RS-485 波特率 |
 | `GRIPPER_SPEED_PCT` | `5` | 夹爪运动速度 % |
@@ -258,7 +258,7 @@ pip install dm-env numpy opencv-python
 ```bash
 sudo usermod -aG dialout $USER
 # 或临时：
-sudo chmod 666 /dev/ttyUSB0
+sudo chmod 666 /dev/ttyUSB1
 ```
 
 ### 7.4 推理部署
@@ -309,7 +309,7 @@ python examples/dobot_umi/check_hardware.py --skip_arm --skip_gripper
 # ── 自定义连接参数
 python examples/dobot_umi/check_hardware.py \
     --dobot_ip 192.168.5.1 \
-    --gripper_port /dev/ttyUSB0 \
+    --gripper_port /dev/ttyUSB1 \
     --gripper_force_pct 30
 ```
 
@@ -331,8 +331,8 @@ python examples/dobot_umi/check_hardware.py \
 ✓  Dobot 机械臂检测通过（未执行任何运动指令）
 
 [2] 知行夹爪（RS-485）
-   打开串口 /dev/ttyUSB0（波特率 115200）...
-✓  串口 /dev/ttyUSB0 初始化成功
+   打开串口 /dev/ttyUSB1（波特率 115200）...
+✓  串口 /dev/ttyUSB1 初始化成功
 ✓  当前编码器位置: 0  →  开口距离: 85.0 mm
 ⚠  跳过开合运动测试（添加 --gripper_test 可启用）
 ✓  知行夹爪检测通过
@@ -363,7 +363,7 @@ python examples/dobot_umi/check_hardware.py \
 |------|---------|---------|
 | Dashboard 连接失败 | 机械臂未上电 / 网线未插 / IP 不对 | 确认网线连通，主机配置 `192.168.5.x/24` 网段 |
 | RobotMode = 9（报警） | 碰撞或限位触发 | 手动操作示教器 ClearError，检查姿态 |
-| 串口初始化失败 | USB-Serial 设备号变化 / 权限不足 | `ls /dev/ttyUSB*` 确认设备节点；`sudo chmod 666 /dev/ttyUSB0` |
+| 串口初始化失败 | USB-Serial 设备号变化 / 权限不足 | `ls /dev/ttyUSB*` 确认设备节点；`sudo chmod 666 /dev/ttyUSB1` |
 | 相机话题超时 | `realsense2_camera` 节点未启动 | `ros2 launch realsense2_camera rs_launch.py` |
 | UMI 话题超时 | UMI 设备未连接或话题名不一致 | 用 `--skip_umi` 跳过，或 `ros2 topic list` 确认话题名 |
 

@@ -114,6 +114,23 @@ runtime:
     step_trace_stride: 0
     replay_feature_batch_size: 16
 
+    # Optional learned gate for multi-stage tasks. While disabled for control,
+    # the rollout still trains the gate from manual `c` critical on/off labels.
+    # After it is stable, set auto_critical_phase_control_enabled: true to let
+    # the model switch critical phase automatically, with manual `c` as override.
+    auto_critical_phase_enabled: true
+    auto_critical_phase_control_enabled: false
+    auto_critical_phase_checkpoint_path: ./runs/dobot_umi/critical_phase_gate/critical_phase_gate.pt
+    auto_critical_phase_image_key: wrist
+    auto_critical_phase_image_size: 96
+    auto_critical_phase_sample_frames: [0, 10, 20, 30, 40]
+    auto_critical_phase_min_samples: 200
+    auto_critical_phase_train_every_steps: 20
+    auto_critical_phase_batch_size: 32
+    auto_critical_phase_lr: 3e-4
+    auto_critical_phase_enter_threshold: 0.75
+    auto_critical_phase_exit_threshold: 0.25
+
     # UMI 人为介入使能
     enable_human_override: true
     safe_fallback_to_ref: true
