@@ -5,7 +5,7 @@ experiment:
     z_dim: 2048
     proprio_dim: 7
     action_representation: delta_chunk
-    action_norm_stats_path: stats/norm_stats_delta.json
+    action_norm_stats_path: stats/norm_stats_delta_critical.json
 
     gamma: 0.99
     fixed_std: 0.002

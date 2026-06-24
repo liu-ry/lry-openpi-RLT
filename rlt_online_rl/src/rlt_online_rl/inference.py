@@ -1118,10 +1118,37 @@ class EnvDriver:
         else:
             windows, terminal_window_added = self._build_chunk_replay_windows(raw_episode, segments, raw_positions)
         transitions = self._build_replay_transitions(raw_episode, segments, windows, feature_cache, stats)
+        terminal_outcome_propagated = self._propagate_terminal_outcome(raw_episode, transitions)
         stats["replay_window_count"] = len(windows)
         stats["terminal_window_added"] = int(terminal_window_added)
+        stats["terminal_outcome_propagated"] = int(terminal_outcome_propagated)
         stats["replay_transition_count"] = len(transitions)
         return transitions, stats
+
+    @staticmethod
+    def _propagate_terminal_outcome(raw_episode: RawEpisodeTrace, transitions: list[RLTTransition]) -> bool:
+        """Keep final success/reward visible when terminal raw steps were dropped."""
+        if not transitions or not raw_episode.steps:
+            return False
+        final_step = raw_episode.steps[-1]
+        terminal_reward = float(sum(float(step.reward) for step in raw_episode.steps))
+        terminal_success = int(final_step.success)
+        if not final_step.done and terminal_success <= 0 and terminal_reward == 0.0:
+            return False
+        if any(bool(transition.done) for transition in transitions) or any(
+            bool(np.any(np.asarray(transition.rewards, dtype=np.float32) != 0.0)) for transition in transitions
+        ):
+            return False
+        if terminal_success > 0 and terminal_reward <= 0.0:
+            terminal_reward = 1.0
+        last_transition = transitions[-1]
+        rewards = np.asarray(last_transition.rewards, dtype=np.float32).copy()
+        if rewards.size and terminal_reward != 0.0:
+            rewards[-1] = terminal_reward
+        last_transition.rewards = rewards
+        last_transition.done = bool(final_step.done)
+        last_transition.success = terminal_success
+        return True
 
     def _seed_feature_cache(self, raw_episode: RawEpisodeTrace) -> dict[int, dict[str, Any]]:
         cache: dict[int, dict[str, Any]] = {}

@@ -9,15 +9,15 @@ experiment:
     proprio_dim: 7
     action_representation: delta_chunk
     # 归一化统计量，由 compute_norm_stats.py 生成
-    action_norm_stats_path: stats/norm_stats_delta.json
+    action_norm_stats_path: stats/norm_stats_delta_critical.json
 
     # ── 算法超参数 ───────────────────────────────────────────────────────────
     gamma: 0.99
     fixed_std: 0.002
-    reference_dropout_prob: 0.2  # 训练时以一定概率丢弃参考动作输入，提升鲁棒性
+    reference_dropout_prob: 0.5  # 训练时以一定概率丢弃参考动作输入，提升鲁棒性
     delta_weight: 10.0
     warmup_bc_weight: 10.0
-    warmup_q_weight: 0.1
+    warmup_q_weight: 0.01
     online_bc_weight: 5.0
     online_q_weight: 0.1
 
@@ -33,7 +33,7 @@ experiment:
 
     # warmup_min_size：收集到 600 条 transition 后进入在线 RL 阶段
     warmup_min_size: 600
-    warmup_post_collect_updates: 5000
+    warmup_post_collect_updates: 6500
     freeze_after_warmup: false
     grad_updates_per_cycle: 5
 
@@ -59,7 +59,7 @@ runtime:
     xla_preallocate: false
 
   learner_service:
-    push_actor_interval_steps: 100
+    push_actor_interval_steps: 300
     checkpoint_interval_steps: 1000
     sample_batch_size: 128
     checkpoint_dir: ./runs/dobot_umi/checkpoints
@@ -75,12 +75,12 @@ runtime:
     bind_host: 127.0.0.1
     port: 9102
     seed: 0
-    sample_strategy: uniform  # uniform / stratified
+    sample_strategy: stratified  # uniform / stratified
     recent_episode_window: 20
     recent_online_ratio: 0.3
     warmup_demo_ratio: 0.3
     # human_intervention_ratio：UMI 人为介入数据在采样中的占比
-    human_intervention_ratio: 0.2
+    human_intervention_ratio: 0.3
 
   env_driver:
     # ── Machine A（Pi0 策略服务器）WebSocket 地址 ────────────────────────────

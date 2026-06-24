@@ -41,7 +41,7 @@ class MotorController:
         """初始化与电机控制器的Modbus RTU通信
 
         参数:
-            port: 串口端口（例如，Windows上为'COM3'，Linux上为'/dev/ttyUSB1'）
+            port: 串口端口（例如，Windows上为'COM3'，Linux上为'/dev/ttyUSB0'）
             slave_id: Modbus从机地址（默认: 1）
             baudrate: 串口波特率（默认: 115200）
             timeout: 读写超时时间（秒，默认: 1.0）
@@ -327,7 +327,7 @@ class MotorController:
 
 if __name__ == "__main__":
     # 示例用法（根据实际设备调整端口/从机ID）
-    PORT = "/dev/ttyUSB1"
+    PORT = "/dev/ttyUSB0"
     SLAVE_ID = 1
     sdk = MotorController(PORT, SLAVE_ID, baudrate=115200, timeout=1.0)
 

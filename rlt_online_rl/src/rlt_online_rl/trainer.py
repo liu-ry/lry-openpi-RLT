@@ -242,9 +242,21 @@ def update_actor(
                 action_q99,
                 action_representation=rl_config.action_representation,
             )
-        pred_step_delta = pred_abs_chunk[:, 1:, :6] - pred_abs_chunk[:, :-1, :6]
-        target_step_delta = target_abs_chunk[:, 1:, :6] - target_abs_chunk[:, :-1, :6]
-        delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
+        joint_dims = min(6, rl_config.action_dim)
+        pred_step_delta = pred_abs_chunk[:, 1:, :joint_dims] - pred_abs_chunk[:, :-1, :joint_dims]
+        target_step_delta = target_abs_chunk[:, 1:, :joint_dims] - target_abs_chunk[:, :-1, :joint_dims]
+        joint_delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
+        if rl_config.action_dim > 6:
+            pred_gripper_step_delta = pred_abs_chunk[:, 1:, 6] - pred_abs_chunk[:, :-1, 6]
+            target_gripper_step_delta = target_abs_chunk[:, 1:, 6] - target_abs_chunk[:, :-1, 6]
+            if use_action_adapter:
+                gripper_scale = jnp.maximum(action_q99[6] - action_q01[6], 1e-6)
+                pred_gripper_step_delta = pred_gripper_step_delta * (2.0 / gripper_scale)
+                target_gripper_step_delta = target_gripper_step_delta * (2.0 / gripper_scale)
+            gripper_delta_penalty = jnp.mean(jnp.square(pred_gripper_step_delta - target_gripper_step_delta))
+        else:
+            gripper_delta_penalty = jnp.array(0.0, dtype=jnp.float32)
+        delta_penalty = joint_delta_penalty + gripper_delta_penalty
         actor_q = jnp.mean(q1)
         weighted_bc = jnp.asarray(bc_weight, dtype=jnp.float32) * bc_penalty
         weighted_q = jnp.asarray(q_weight, dtype=jnp.float32) * actor_q
@@ -259,6 +271,8 @@ def update_actor(
             "human_mask_ratio": human_mask_ratio,
             "policy_mask_ratio": 1.0 - human_mask_ratio,
             "delta_penalty": delta_penalty,
+            "joint_delta_penalty": joint_delta_penalty,
+            "gripper_delta_penalty": gripper_delta_penalty,
             "weighted_bc": weighted_bc,
             "weighted_delta": weighted_delta,
             "weighted_q": weighted_q,
@@ -307,6 +321,8 @@ def train_step(
         "human_mask_ratio": jnp.array(0.0, dtype=jnp.float32),
         "policy_mask_ratio": jnp.array(0.0, dtype=jnp.float32),
         "delta_penalty": jnp.array(0.0, dtype=jnp.float32),
+        "joint_delta_penalty": jnp.array(0.0, dtype=jnp.float32),
+        "gripper_delta_penalty": jnp.array(0.0, dtype=jnp.float32),
         "weighted_bc": jnp.array(0.0, dtype=jnp.float32),
         "weighted_delta": jnp.array(0.0, dtype=jnp.float32),
         "weighted_q": jnp.array(0.0, dtype=jnp.float32),
