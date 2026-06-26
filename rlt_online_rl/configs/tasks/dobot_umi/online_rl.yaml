@@ -32,8 +32,8 @@ experiment:
     actor_update_period: 2
 
     # warmup_min_size：收集到 600 条 transition 后进入在线 RL 阶段
-    warmup_min_size: 600
-    warmup_post_collect_updates: 6500
+    warmup_min_size: 1000
+    warmup_post_collect_updates: 10000
     freeze_after_warmup: false
     grad_updates_per_cycle: 5
 
@@ -59,9 +59,9 @@ runtime:
     xla_preallocate: false
 
   learner_service:
-    push_actor_interval_steps: 300
+    push_actor_interval_steps: 100
     checkpoint_interval_steps: 1000
-    sample_batch_size: 128
+    sample_batch_size: 64
     checkpoint_dir: ./runs/dobot_umi/checkpoints
     actor_snapshot_path: ./runs/dobot_umi/actor_snapshot/actor_snapshot.pkl
     replay_url: http://127.0.0.1:9102
@@ -75,7 +75,7 @@ runtime:
     bind_host: 127.0.0.1
     port: 9102
     seed: 0
-    sample_strategy: stratified  # uniform / stratified
+    sample_strategy: uniform  # uniform / stratified
     recent_episode_window: 20
     recent_online_ratio: 0.3
     warmup_demo_ratio: 0.3
@@ -105,7 +105,7 @@ runtime:
     full_task_reset_action:      [0.5793687, -0.1360939, 0.2334053, 3.14, 0.0, -1.57, 0.08]
     critical_phase_reset_action: [0.5793687, -0.1360939, 0.2334053, 3.14, 0.0, -1.57, 0.08]
 
-    actor_deterministic: true # 评估时使用确定性动作 true（均值），训练时使用随机动作 false （均值+固定方差噪声）
+    actor_deterministic: false # 评估时使用确定性动作 true（均值），训练时使用随机动作 false （均值+固定方差噪声）
     chunk_exec_horizon: 30
 
     # 越疆 Dobot 推荐控制频率：20 Hz
@@ -119,12 +119,13 @@ runtime:
     # After it is stable, set auto_critical_phase_control_enabled: true to let
     # the model switch critical phase automatically, with manual `c` as override.
     auto_critical_phase_enabled: true
+    # 先只收集人工标签，等 gate 训练到 ready 后再手动打开自动控制。
     auto_critical_phase_control_enabled: false
     auto_critical_phase_checkpoint_path: ./runs/dobot_umi/critical_phase_gate/critical_phase_gate.pt
     auto_critical_phase_image_key: wrist
     auto_critical_phase_image_size: 96
     auto_critical_phase_sample_frames: [0, 10, 20, 30, 40]
-    auto_critical_phase_min_samples: 200
+    auto_critical_phase_min_samples: 50
     auto_critical_phase_train_every_steps: 20
     auto_critical_phase_batch_size: 32
     auto_critical_phase_lr: 3e-4
