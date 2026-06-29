@@ -49,12 +49,14 @@ if str(SRC_ROOT) not in sys.path:
 
 PIKA_SYNC_ROS = REPO_ROOT / "train_deploy_alignment" / "pika_sync_ros.py"
 DOBOT_UMI_ROS = REPO_ROOT / "train_deploy_alignment" / "dobot_umi_ros.py"
+ROKAE_ZHIXING_DUAL_ROS = REPO_ROOT / "train_deploy_alignment" / "rokae_zhixing_dual_ros.py"
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "tasks" / "agilex_ethernet" / "online_rl.yaml"
 
 # 内置 ROS 脚本映射表，通过 --ros_script 选项引用
 _ROS_SCRIPTS: dict[str, Path] = {
     "pika":      PIKA_SYNC_ROS,
     "dobot_umi": DOBOT_UMI_ROS,
+    "rokae_zhixing_dual": ROKAE_ZHIXING_DUAL_ROS,
 }
 
 from rlt_online_rl.config import load_system_config_yaml
@@ -69,6 +71,15 @@ def _peek_option(argv: list[str], flag: str) -> str | None:
         if token.startswith(f"{flag}="):
             return token.split("=", 1)[1]
     return None
+
+
+def _resolve_ros_script_from_config(config_path: str) -> Path:
+    config_parts = Path(config_path).expanduser().resolve().parts
+    if "dobot_umi" in config_parts:
+        return DOBOT_UMI_ROS
+    if "rokae_zhixing_dual" in config_parts:
+        return ROKAE_ZHIXING_DUAL_ROS
+    return PIKA_SYNC_ROS
 
 
 def _wait_for_http(url: str, *, timeout_sec: float = 30.0) -> None:
@@ -100,7 +111,8 @@ def main() -> None:
         else:
             ros_script = Path(ros_script_key).expanduser().resolve()
     else:
-        ros_script = PIKA_SYNC_ROS   # 默认行为，向后兼容
+        config_for_script = _peek_option(argv, "--config") or str(DEFAULT_CONFIG)
+        ros_script = _resolve_ros_script_from_config(config_for_script)
 
     config_path = _peek_option(argv, "--config") or str(DEFAULT_CONFIG)
     system = load_system_config_yaml(config_path)
