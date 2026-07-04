@@ -24,6 +24,7 @@ import openpi.policies.agilexbag_image_policy as agilexbag_image_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.rokae_dual_policy as rokae_dual_policy
 import openpi.policies.vitai_policy as vitai_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -270,6 +271,61 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         )
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRokaeDualDataConfig(DataConfigFactory):
+    """Data config for dual Rokae AR arms with three RGB cameras."""
+
+    use_delta_joint_actions: bool = False
+    default_prompt: str | None = None
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "actions",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("actions",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                rokae_dual_policy.RokaeDualInputs(
+                    action_dim=model_config.action_dim,
+                )
+            ],
+            outputs=[rokae_dual_policy.RokaeDualOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            # Layout: left 7 joints, left gripper, right 7 joints, right gripper.
+            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -1005,7 +1061,6 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=64,
     ),
-    #
     # Fine-tuning DROID configs.
     #
     TrainConfig(
@@ -1477,6 +1532,100 @@ _CONFIGS = [
         # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/liury/src/lry-openpi-RLT/checkpoints/pi05_vitai_lora_finetune_with_tactile_0616/pi05_vitai_lora_finetune_with_tactile_0616_2_multiGPU/24000/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=8,
+        keep_period=2000,
+        wandb_enabled=True,
+        # Stage1：VLA 完全冻结，只训练 rlt_module
+        rlt_alpha=0.0,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+    ),
+    # 4.rokae 双臂叠纸杯
+    TrainConfig(
+        name="pi05_rokae_dual_lora_finetune_stack_paper_cups",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotRokaeDualDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_cups_0704",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_cups_0704/assets",
+            ),
+            default_prompt="Pick up the paper cups and stack them up",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+        num_train_steps=100_000,
+        batch_size=16,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        keep_period=5000,
+        wandb_enabled=True,
+        num_workers=4,
+    ),
+    #
+    # RLT (Representation Learning Token) configs.
+    #
+    TrainConfig(
+        name="rlt_pi05_rokae_dual_lora_stack_paper_cups",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotRokaeDualDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_cups_0704",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_cups_0704/assets",
+            ),
+            default_prompt="Pick up the paper cups and stack them up",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/lry/src/lry/lry-openpi-RLT/checkpoints/pi05_rokae_dual_lora_finetune_stack_paper_cups/rokae_dual_stack_paper_cups/100000/params"
         ),
         num_train_steps=50_000,
         batch_size=8,
