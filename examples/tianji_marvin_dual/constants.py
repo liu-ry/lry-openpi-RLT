@@ -1,0 +1,77 @@
+"""Constants for dual Tianji Marvin arms with Zhixing grippers."""
+# ruff: noqa
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Control cycle. Keep 50 Hz by default to match the existing rollout runtime.
+DT = 0.02
+
+# Vendored Tianji Marvin SDK location.
+TIANJI_SDK_PYTHON_DIR = str(REPO_ROOT / "third_party" / "tianji_marvin_sdk")
+TIANJI_KINEMATICS_CONFIG_PATH = str(Path(TIANJI_SDK_PYTHON_DIR) / "ccs_m6_40.MvKDCfg")
+
+# One Tianji controller manages both arms A and B.
+ROBOT_IP = "192.168.1.190"
+LEFT_ARM_ID = "A"
+RIGHT_ARM_ID = "B"
+
+# Tianji Marvin arm is 7-DoF. One arm action is [j1..j7, gripper_m].
+ARM_DOF = 7
+SINGLE_ARM_ACTION_DIM = ARM_DOF + 1
+DUAL_ACTION_DIM = SINGLE_ARM_ACTION_DIM * 2
+
+# SDK control parameters. MarvinSDK uses percent for position state and ratios
+# for movej planning.
+TIANJI_POSITION_VEL_RATIO = 10
+TIANJI_POSITION_ACC_RATIO = 10
+TIANJI_MOVEJ_VEL_RATIO = 0.1
+TIANJI_MOVEJ_ACC_RATIO = 0.1
+
+# Safety clamps for policy/teleop absolute joint targets.
+MAX_JOINT_DELTA_RAD = 0.03
+MAX_GRIPPER_DELTA_M = 0.01
+
+# Optional calibrated reset end poses in repository policy format:
+# [x_m, y_m, z_m, rx_rad, ry_rad, rz_rad].
+# Keep unset until measured on the actual Tianji setup.
+LEFT_RESET_END_POSE = None
+RIGHT_RESET_END_POSE = None
+
+# Optional joint reset poses in radians. If provided by the policy server or
+# by code, these take precedence over the 6D end-pose IK reset above.
+# The runtime refuses to move to all-zero joint reset poses unless explicitly allowed.
+LEFT_RESET_JOINT_POSITIONS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+RIGHT_RESET_JOINT_POSITIONS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+ALLOW_ZERO_RESET_POSE = False
+
+# Zhixing grippers. Use separate serial adapters if both grippers share slave id.
+LEFT_GRIPPER_SERIAL_PORT = "/dev/ttyUSB0"
+LEFT_GRIPPER_SLAVE_ID = 1
+RIGHT_GRIPPER_SERIAL_PORT = "/dev/ttyUSB1"
+RIGHT_GRIPPER_SLAVE_ID = 1
+GRIPPER_BAUDRATE = 115200
+GRIPPER_SPEED_PCT = 5
+GRIPPER_FORCE_PCT = 50
+GRIPPER_POS_OPEN = 0
+GRIPPER_POS_CLOSE = 12000
+GRIPPER_OPEN_M = 0.085
+GRIPPER_CLOSE_M = 0.0
+
+# RealSense cameras. Names are kept compatible with common OpenPI configs.
+REALSENSE_FRONT_SERIAL = "341522300463"
+REALSENSE_LEFT_WRIST_SERIAL = "427622270458"
+REALSENSE_RIGHT_WRIST_SERIAL = ""
+REALSENSE_WIDTH = 640
+REALSENSE_HEIGHT = 480
+REALSENSE_FPS = 30
+
+IMAGE_KEY_FRONT = "cam_front"
+IMAGE_KEY_LEFT_WRIST = "cam_left_wrist"
+IMAGE_KEY_RIGHT_WRIST = "cam_right_wrist"
+
+# Optional tactile cameras, reused from the Dobot+UMI example if available.
+TACTILE_LEFT_SERIAL = "GF22511615AAF"
+TACTILE_RIGHT_SERIAL = "GF22513812AF6"
+IMAGE_KEY_TACTILE_LEFT = "tactile_left"
+IMAGE_KEY_TACTILE_RIGHT = "tactile_right"

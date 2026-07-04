@@ -32,6 +32,8 @@ __pycache__/
 # C extensions
 *.so
 !third_party/rokae_xcore_sdk/pyrokae/*.so*
+!third_party/tianji_marvin_sdk/libKine.so
+!third_party/tianji_marvin_sdk/libMarvinSDK.so
 
 # Distribution / packaging
 .Python

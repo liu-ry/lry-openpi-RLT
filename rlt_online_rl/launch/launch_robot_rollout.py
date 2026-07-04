@@ -50,6 +50,7 @@ if str(SRC_ROOT) not in sys.path:
 PIKA_SYNC_ROS = REPO_ROOT / "train_deploy_alignment" / "pika_sync_ros.py"
 DOBOT_UMI_ROS = REPO_ROOT / "train_deploy_alignment" / "dobot_umi_ros.py"
 ROKAE_ZHIXING_DUAL_ROS = REPO_ROOT / "train_deploy_alignment" / "rokae_zhixing_dual_ros.py"
+TIANJI_MARVIN_DUAL_ROS = REPO_ROOT / "train_deploy_alignment" / "tianji_marvin_dual_ros.py"
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "tasks" / "agilex_ethernet" / "online_rl.yaml"
 
 # 内置 ROS 脚本映射表，通过 --ros_script 选项引用
@@ -57,6 +58,7 @@ _ROS_SCRIPTS: dict[str, Path] = {
     "pika":      PIKA_SYNC_ROS,
     "dobot_umi": DOBOT_UMI_ROS,
     "rokae_zhixing_dual": ROKAE_ZHIXING_DUAL_ROS,
+    "tianji_marvin_dual": TIANJI_MARVIN_DUAL_ROS,
 }
 
 from rlt_online_rl.config import load_system_config_yaml
@@ -79,6 +81,8 @@ def _resolve_ros_script_from_config(config_path: str) -> Path:
         return DOBOT_UMI_ROS
     if "rokae_zhixing_dual" in config_parts:
         return ROKAE_ZHIXING_DUAL_ROS
+    if "tianji_marvin_dual" in config_parts:
+        return TIANJI_MARVIN_DUAL_ROS
     return PIKA_SYNC_ROS
 
 
