@@ -1546,7 +1546,7 @@ _CONFIGS = [
     ),
     # 4.rokae 双臂叠纸杯
     TrainConfig(
-        name="pi05_rokae_dual_lora_finetune_stack_paper_cups",
+        name="pi05_rokae_dual_lora_finetune_stack_paper_cups_0704",
         model=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
@@ -1579,7 +1579,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
         num_train_steps=100_000,
-        batch_size=16,
+        batch_size=64,
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
@@ -1592,7 +1592,7 @@ _CONFIGS = [
     # RLT (Representation Learning Token) configs.
     #
     TrainConfig(
-        name="rlt_pi05_rokae_dual_lora_stack_paper_cups",
+        name="rlt_pi05_rokae_dual_lora_stack_paper_cups_0704",
         model=pi0_config.Pi0Config(
             pi05=True,
             paligemma_variant="gemma_2b_lora",
@@ -1625,7 +1625,7 @@ _CONFIGS = [
         ),
         # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/lry/src/lry/lry-openpi-RLT/checkpoints/pi05_rokae_dual_lora_finetune_stack_paper_cups/rokae_dual_stack_paper_cups/100000/params"
+            "/liury/src/lry-openpi-RLT/checkpoints/pi05_rokae_dual_lora_finetune_stack_paper_cups_0704/pi05_rokae_dual_lora_finetune_stack_paper_cups_0704_1/40000/params"
         ),
         num_train_steps=50_000,
         batch_size=8,

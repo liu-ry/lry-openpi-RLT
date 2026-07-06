@@ -63,6 +63,23 @@ def _infer_prefix_seq_len(model_config: _model.BaseModelConfig) -> int:
     return embs_shape.shape[1]
 
 
+def _infer_robot_action_dim(
+    output_transforms: Sequence[_transforms.DataTransformFn],
+    *,
+    model_action_horizon: int,
+    model_action_dim: int,
+) -> int:
+    fake = {
+        "state": np.zeros(model_action_dim, dtype=np.float32),
+        "actions": np.zeros((model_action_horizon, model_action_dim), dtype=np.float32),
+    }
+    outputs = _transforms.compose(output_transforms)(fake)
+    actions = np.asarray(outputs["actions"], dtype=np.float32)
+    if actions.ndim != 2:
+        raise ValueError(f"Expected transformed actions to be rank-2, got {actions.shape}")
+    return int(actions.shape[-1])
+
+
 class RLTInferenceModel(nnx.Module):
     """Combined VLA + RLT model for inference. Outputs both actions and RL tokens."""
 
@@ -112,12 +129,6 @@ class RLTInferenceModel(nnx.Module):
         return actions, rl_token
 
 
-# Constants for output format
-PROPRIO_DIM = 7
-CHUNK_LEN = 50
-ACTION_DIM = 7
-
-
 class RLTPolicy(_base_policy.BasePolicy):
     """Policy that returns both VLA actions and RL tokens via WebSocket.
 
@@ -134,6 +145,10 @@ class RLTPolicy(_base_policy.BasePolicy):
         transforms: Sequence[_transforms.DataTransformFn] = (),
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
         metadata: dict[str, Any] | None = None,
+        z_dim: int = 2048,
+        proprio_dim: int = 7,
+        chunk_len: int = 50,
+        action_dim: int = 7,
     ):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
@@ -141,6 +156,10 @@ class RLTPolicy(_base_policy.BasePolicy):
         self._metadata = metadata or {}
         self._rng = rng or jax.random.key(0)
         self._infer_fn = nnx_utils.module_jit(model.infer)
+        self._z_dim = int(z_dim)
+        self._proprio_dim = int(proprio_dim)
+        self._chunk_len = int(chunk_len)
+        self._action_dim = int(action_dim)
 
     @override
     def infer(self, obs: dict) -> dict:
@@ -259,16 +278,16 @@ class RLTPolicy(_base_policy.BasePolicy):
         outputs = self._output_transform(outputs)
 
         # z_rl
-        z_rl = rl_token_flat
+        z_rl = rl_token_flat[: self._z_dim]
 
         # proprio
-        proprio = np.zeros(PROPRIO_DIM, dtype=np.float32)
-        n = min(PROPRIO_DIM, raw_state.shape[0])
+        proprio = np.zeros(self._proprio_dim, dtype=np.float32)
+        n = min(self._proprio_dim, raw_state.shape[0])
         proprio[:n] = raw_state[:n].astype(np.float32)
 
         # ref_chunk
         vla_actions = outputs["actions"]
-        ref_chunk = vla_actions[:CHUNK_LEN, :ACTION_DIM].astype(np.float32)
+        ref_chunk = vla_actions[: self._chunk_len, : self._action_dim].astype(np.float32)
 
         return {
             "z_rl": z_rl,
@@ -344,6 +363,8 @@ def main(args: Args) -> None:
         shared_prefix_inference=args.shared_prefix_inference,
     )
 
+    rlt_config = _create_rlt_config(config)
+    z_dim = int(rlt_config.num_rl_tokens * rlt_config.embed_dim)
     data_config = config.data.create(config.assets_dirs, config.model)
     checkpoint_path = pathlib.Path(args.checkpoint_dir)
     norm_stats = None
@@ -365,6 +386,13 @@ def main(args: Args) -> None:
     if norm_stats:
         output_transforms.append(_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm))
     output_transforms.extend(data_config.data_transforms.outputs)
+    chunk_len = int(config.model.action_horizon)
+    action_dim = _infer_robot_action_dim(
+        output_transforms,
+        model_action_horizon=chunk_len,
+        model_action_dim=int(config.model.action_dim),
+    )
+    proprio_dim = action_dim
 
     policy = RLTPolicy(
         model,
@@ -373,22 +401,30 @@ def main(args: Args) -> None:
         metadata={
             **(config.policy_metadata or {}),
             "has_rl_token": True,
-            "z_dim": 2048,
-            "proprio_dim": PROPRIO_DIM,
-            "chunk_len": CHUNK_LEN,
-            "action_dim": ACTION_DIM,
+            "z_dim": z_dim,
+            "proprio_dim": proprio_dim,
+            "chunk_len": chunk_len,
+            "action_dim": action_dim,
             "supports_batch": True,
             "shared_prefix_inference": args.shared_prefix_inference,
             "use_tactile": bool(getattr(config.model, "use_tactile", False)),
         },
+        z_dim=z_dim,
+        proprio_dim=proprio_dim,
+        chunk_len=chunk_len,
+        action_dim=action_dim,
     )
 
     # Test single inference
     logging.info("Testing single inference...")
-    # Use data-level keys that vitai_policy.infer() expects.
+    # Include common data-level camera keys so startup validation works across
+    # Dobot/VitAI-style configs and dual Rokae configs.
     fake_images = {
         "cam_front": np.zeros((224, 224, 3), dtype=np.uint8),
         "cam_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_high": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_left_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_right_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
     }
     if getattr(config.model, "use_tactile", False):
         fake_images.update(
@@ -399,7 +435,7 @@ def main(args: Args) -> None:
         )
     fake_dict = {
         "images": fake_images,
-        "state": np.zeros(PROPRIO_DIM, dtype=np.float32),
+        "state": np.zeros(proprio_dim, dtype=np.float32),
         "prompt": "test prompt",
     }
     try:

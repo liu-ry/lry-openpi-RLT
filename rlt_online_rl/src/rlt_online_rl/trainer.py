@@ -34,6 +34,20 @@ from rlt_online_rl.runtime_logging import append_jsonl
 logger = logging.getLogger(__name__)
 
 
+def _delta_joint_indices(action_dim: int) -> tuple[int, ...]:
+    if action_dim >= 16:
+        return (*range(0, 7), *range(8, 15))
+    return tuple(range(min(6, action_dim)))
+
+
+def _gripper_indices(action_dim: int) -> tuple[int, ...]:
+    if action_dim >= 16:
+        return (7, 15)
+    if action_dim > 6:
+        return (6,)
+    return ()
+
+
 def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
     tmp_path = f"{path}.tmp"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -242,15 +256,19 @@ def update_actor(
                 action_q99,
                 action_representation=rl_config.action_representation,
             )
-        joint_dims = min(6, rl_config.action_dim)
-        pred_step_delta = pred_abs_chunk[:, 1:, :joint_dims] - pred_abs_chunk[:, :-1, :joint_dims]
-        target_step_delta = target_abs_chunk[:, 1:, :joint_dims] - target_abs_chunk[:, :-1, :joint_dims]
+        joint_indices = _delta_joint_indices(rl_config.action_dim)
+        pred_step_delta = pred_abs_chunk[:, 1:, joint_indices] - pred_abs_chunk[:, :-1, joint_indices]
+        target_step_delta = target_abs_chunk[:, 1:, joint_indices] - target_abs_chunk[:, :-1, joint_indices]
         joint_delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
-        if rl_config.action_dim > 6:
-            pred_gripper_step_delta = pred_abs_chunk[:, 1:, 6] - pred_abs_chunk[:, :-1, 6]
-            target_gripper_step_delta = target_abs_chunk[:, 1:, 6] - target_abs_chunk[:, :-1, 6]
+        gripper_indices = _gripper_indices(rl_config.action_dim)
+        if gripper_indices:
+            pred_gripper_step_delta = pred_abs_chunk[:, 1:, gripper_indices] - pred_abs_chunk[:, :-1, gripper_indices]
+            target_gripper_step_delta = (
+                target_abs_chunk[:, 1:, gripper_indices] - target_abs_chunk[:, :-1, gripper_indices]
+            )
             if use_action_adapter:
-                gripper_scale = jnp.maximum(action_q99[6] - action_q01[6], 1e-6)
+                gripper_index_array = jnp.asarray(gripper_indices)
+                gripper_scale = jnp.maximum(action_q99[gripper_index_array] - action_q01[gripper_index_array], 1e-6)
                 pred_gripper_step_delta = pred_gripper_step_delta * (2.0 / gripper_scale)
                 target_gripper_step_delta = target_gripper_step_delta * (2.0 / gripper_scale)
             gripper_delta_penalty = jnp.mean(jnp.square(pred_gripper_step_delta - target_gripper_step_delta))

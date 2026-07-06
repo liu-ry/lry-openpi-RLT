@@ -17,7 +17,9 @@ LEFT_ARM_LOCAL_IP = "192.168.10.160"
 RIGHT_ARM_REMOTE_IP = "192.168.10.163"
 RIGHT_ARM_LOCAL_IP = "192.168.10.160"
 
-# Rokae AR is 7-DoF. One arm action is [j1..j7, gripper_m].
+# Rokae AR is 7-DoF. Runtime hardware wrappers use [j1..j7 rad, gripper_m].
+# The RLT/policy/replay layer for this task uses converted dataset units:
+# [j1..j7 deg, gripper_mm] per arm.
 ARM_DOF = 7
 SINGLE_ARM_ACTION_DIM = ARM_DOF + 1
 DUAL_ACTION_DIM = SINGLE_ARM_ACTION_DIM * 2
@@ -32,6 +34,16 @@ ROKAE_MOVEJ_ZONE = -1.0
 # Safety clamps for policy/teleop absolute joint targets.
 MAX_JOINT_DELTA_RAD = 0.03
 MAX_GRIPPER_DELTA_M = 0.01
+JOINT_LIMITS_DEG = (
+    (-178.0, 178.0),
+    (-120.0, 120.0),
+    (-178.0, 178.0),
+    (-60.0, 145.0),
+    (-178.0, 178.0),
+    (-50.0, 50.0),
+    (-50.0, 50.0),
+)
+JOINT_LIMIT_MARGIN_DEG = 5.0
 
 # Default reset end poses in Rokae getEndPose() format:
 # [x_m, y_m, z_m, rx_rad, ry_rad, rz_rad].
@@ -66,7 +78,7 @@ REALSENSE_WIDTH = 640
 REALSENSE_HEIGHT = 480
 REALSENSE_FPS = 30
 
-IMAGE_KEY_FRONT = "cam_front"
+IMAGE_KEY_FRONT = "cam_high"
 IMAGE_KEY_LEFT_WRIST = "cam_left_wrist"
 IMAGE_KEY_RIGHT_WRIST = "cam_right_wrist"
 

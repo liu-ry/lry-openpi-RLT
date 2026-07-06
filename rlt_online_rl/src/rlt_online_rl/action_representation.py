@@ -56,6 +56,18 @@ def _broadcast_state0_jax(state0: jnp.ndarray, chunk: jnp.ndarray) -> jnp.ndarra
     return state0
 
 
+def _delta_joint_indices_np(dim: int) -> np.ndarray:
+    if dim >= 16:
+        return np.asarray([*range(0, 7), *range(8, 15)], dtype=np.int64)
+    return np.arange(min(6, dim), dtype=np.int64)
+
+
+def _delta_joint_indices_jax(dim: int) -> jnp.ndarray:
+    if dim >= 16:
+        return jnp.asarray([*range(0, 7), *range(8, 15)], dtype=jnp.int32)
+    return jnp.arange(min(6, dim), dtype=jnp.int32)
+
+
 def jax_quantile_denormalize(x: jnp.ndarray, q01: jnp.ndarray, q99: jnp.ndarray) -> jnp.ndarray:
     q01 = jnp.asarray(q01, dtype=jnp.float32)
     q99 = jnp.asarray(q99, dtype=jnp.float32)
@@ -66,7 +78,8 @@ def jax_quantile_denormalize(x: jnp.ndarray, q01: jnp.ndarray, q99: jnp.ndarray)
 def jax_delta_to_abs_chunk(chunk_delta: jnp.ndarray, state0: jnp.ndarray) -> jnp.ndarray:
     chunk_delta = jnp.asarray(chunk_delta, dtype=jnp.float32)
     state0 = _broadcast_state0_jax(state0, chunk_delta)
-    chunk_abs = chunk_delta.at[..., :6].add(state0[..., :6])
+    joint_indices = _delta_joint_indices_jax(chunk_delta.shape[-1])
+    chunk_abs = chunk_delta.at[..., joint_indices].add(state0[..., joint_indices])
     return chunk_abs
 
 
@@ -100,7 +113,8 @@ class ActionRepresentationAdapter:
         state0 = _broadcast_state0(state0, chunk_abs)
         chunk_delta = chunk_abs.copy()
         zero_mask = _zero_row_mask(chunk_abs)
-        chunk_delta[..., :6] = chunk_abs[..., :6] - state0[..., :6]
+        joint_indices = _delta_joint_indices_np(chunk_abs.shape[-1])
+        chunk_delta[..., joint_indices] = chunk_abs[..., joint_indices] - state0[..., joint_indices]
         chunk_delta = np.where(zero_mask, 0.0, chunk_delta)
         return chunk_delta
 
@@ -108,7 +122,8 @@ class ActionRepresentationAdapter:
         chunk_delta = np.asarray(chunk_delta, dtype=np.float32)
         state0 = _broadcast_state0(state0, chunk_delta)
         chunk_abs = chunk_delta.copy()
-        chunk_abs[..., :6] = chunk_delta[..., :6] + state0[..., :6]
+        joint_indices = _delta_joint_indices_np(chunk_delta.shape[-1])
+        chunk_abs[..., joint_indices] = chunk_delta[..., joint_indices] + state0[..., joint_indices]
         return chunk_abs
 
     def _to_representation(self, chunk_abs: np.ndarray, state0: np.ndarray) -> np.ndarray:

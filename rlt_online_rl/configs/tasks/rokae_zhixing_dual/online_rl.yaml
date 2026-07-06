@@ -1,6 +1,7 @@
 experiment:
   rl:
-    # 16D: left_j1..left_j7, left_gripper_m, right_j1..right_j7, right_gripper_m
+    # 16D policy/RLT units: left_j1..left_j7 deg, left_gripper_mm,
+    # right_j1..right_j7 deg, right_gripper_mm.
     action_dim: 16
     chunk_len: 50
     z_dim: 2048
@@ -86,7 +87,9 @@ runtime:
     task_mode: critical_phase
     episode_start_control_mode: policy
 
-    # 16D reset action. If left null, rokae_zhixing_dual_ros.py uses
+    # 16D reset action in dataset/RLT units:
+    # [left joints deg, left gripper mm, right joints deg, right gripper mm].
+    # If left null, rokae_zhixing_dual_ros.py uses
     # examples/rokae_zhixing_dual/constants.py LEFT/RIGHT_RESET_END_POSE and IK.
     full_task_reset_action: null
     critical_phase_reset_action: null

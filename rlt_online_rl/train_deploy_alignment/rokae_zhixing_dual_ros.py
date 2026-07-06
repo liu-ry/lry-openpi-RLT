@@ -79,9 +79,11 @@ class NullHumanActionRecorder:
 
 
 class DualRokaeRobotBridge:
+    # Public RLT/replay/action units follow the converted LeRobot dataset:
+    # joints in degrees, grippers in millimeters. Hardware SDK calls stay rad/m.
     DEFAULT_ACTION_DELTA_LIMITS: tuple[float, ...] = (
-        0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.01,
-        0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.01,
+        1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 10.0,
+        1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 10.0,
     )
 
     def __init__(
@@ -98,7 +100,59 @@ class DualRokaeRobotBridge:
         self._right_gripper = right_gripper
         self._image_recorder = image_recorder
         self._lock = threading.Lock()
-        self._last_sent: np.ndarray | None = None
+        self._last_sent_hw: np.ndarray | None = None
+
+    @staticmethod
+    def _joint_slices() -> tuple[slice, slice]:
+        return (
+            slice(0, rokae_constants.ARM_DOF),
+            slice(rokae_constants.SINGLE_ARM_ACTION_DIM, rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF),
+        )
+
+    @staticmethod
+    def _gripper_indices() -> tuple[int, int]:
+        return (
+            rokae_constants.ARM_DOF,
+            rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF,
+        )
+
+    @classmethod
+    def _hardware_to_policy_units(cls, values_hw: np.ndarray) -> np.ndarray:
+        """Convert hardware units rad/m to dataset/RLT units degree/mm."""
+        converted = np.asarray(values_hw, dtype=np.float32).copy()
+        for slc in cls._joint_slices():
+            converted[slc] = np.rad2deg(converted[slc])
+        for idx in cls._gripper_indices():
+            converted[idx] = converted[idx] * 1000.0
+        return converted
+
+    @classmethod
+    def _policy_to_hardware_units(cls, values_policy: np.ndarray) -> np.ndarray:
+        """Convert dataset/RLT units degree/mm to hardware units rad/m."""
+        converted = np.asarray(values_policy, dtype=np.float32).copy()
+        for slc in cls._joint_slices():
+            converted[slc] = np.deg2rad(converted[slc])
+        for idx in cls._gripper_indices():
+            converted[idx] = converted[idx] * 0.001
+        return converted
+
+    @classmethod
+    def _clip_joint_limits_hw(cls, values_hw: np.ndarray) -> np.ndarray:
+        clipped = np.asarray(values_hw, dtype=np.float32).copy()
+        limits_deg = np.asarray(rokae_constants.JOINT_LIMITS_DEG, dtype=np.float32)
+        margin = float(rokae_constants.JOINT_LIMIT_MARGIN_DEG)
+        lower = np.deg2rad(limits_deg[:, 0] + margin)
+        upper = np.deg2rad(limits_deg[:, 1] - margin)
+        for slc in cls._joint_slices():
+            clipped[slc] = np.clip(clipped[slc], lower, upper)
+        return clipped
+
+    def _get_hardware_state(self) -> np.ndarray:
+        left_q = self._arms.left.get_joint_angles_rad()
+        right_q = self._arms.right.get_joint_angles_rad()
+        left_g = float(np.clip(self._left_gripper.get_position_m(), 0.0, rokae_constants.GRIPPER_OPEN_M))
+        right_g = float(np.clip(self._right_gripper.get_position_m(), 0.0, rokae_constants.GRIPPER_OPEN_M))
+        return np.concatenate([left_q, [left_g], right_q, [right_g]], dtype=np.float32)
 
     def shutdown(self) -> None:
         try:
@@ -127,11 +181,7 @@ class DualRokaeRobotBridge:
 
     def get_observation(self, resize_hw: tuple[int, int], task: str) -> dict[str, Any]:
         images = self._image_recorder.get_images(resize_hw=resize_hw)
-        left_q = self._arms.left.get_joint_angles_rad()
-        right_q = self._arms.right.get_joint_angles_rad()
-        left_g = float(np.clip(self._left_gripper.get_position_m(), 0.0, rokae_constants.GRIPPER_OPEN_M))
-        right_g = float(np.clip(self._right_gripper.get_position_m(), 0.0, rokae_constants.GRIPPER_OPEN_M))
-        state = np.concatenate([left_q, [left_g], right_q, [right_g]], dtype=np.float32)
+        state = self._hardware_to_policy_units(self._get_hardware_state())
         return {
             "state": state,
             "images": {
@@ -149,50 +199,49 @@ class DualRokaeRobotBridge:
         }
 
     def send_action(self, action16: np.ndarray) -> np.ndarray:
-        action = np.asarray(action16, dtype=np.float32).reshape(-1)
-        if action.shape[0] < rokae_constants.DUAL_ACTION_DIM:
-            raise ValueError(f"Expected 16D dual Rokae action, got {action.shape}")
-        if not np.all(np.isfinite(action[: rokae_constants.DUAL_ACTION_DIM])):
+        action_policy = np.asarray(action16, dtype=np.float32).reshape(-1)
+        if action_policy.shape[0] < rokae_constants.DUAL_ACTION_DIM:
+            raise ValueError(f"Expected 16D dual Rokae action, got {action_policy.shape}")
+        action_policy = action_policy[: rokae_constants.DUAL_ACTION_DIM]
+        if not np.all(np.isfinite(action_policy)):
             self._arms.stop()
             raise ValueError("Action contains NaN or Inf")
         with self._lock:
-            limited = self._limit_action(action[: rokae_constants.DUAL_ACTION_DIM])
-            left_q = limited[: rokae_constants.ARM_DOF]
-            left_g = float(limited[rokae_constants.ARM_DOF])
+            desired_hw = self._policy_to_hardware_units(action_policy)
+            limited_hw = self._limit_action(desired_hw)
+            left_q = limited_hw[: rokae_constants.ARM_DOF]
+            left_g = float(limited_hw[rokae_constants.ARM_DOF])
             right_base = rokae_constants.SINGLE_ARM_ACTION_DIM
-            right_q = limited[right_base : right_base + rokae_constants.ARM_DOF]
-            right_g = float(limited[right_base + rokae_constants.ARM_DOF])
+            right_q = limited_hw[right_base : right_base + rokae_constants.ARM_DOF]
+            right_g = float(limited_hw[right_base + rokae_constants.ARM_DOF])
             self._arms.servo_j(np.concatenate([left_q, right_q], dtype=np.float32))
             self._left_gripper.set_opening_m(left_g)
             self._right_gripper.set_opening_m(right_g)
-            self._last_sent = limited.copy()
-            return limited.copy()
+            self._last_sent_hw = limited_hw.copy()
+            return self._hardware_to_policy_units(limited_hw)
 
-    def _limit_action(self, desired: np.ndarray) -> np.ndarray:
-        desired = desired.astype(np.float32, copy=True)
+    def _limit_action(self, desired_hw: np.ndarray) -> np.ndarray:
+        desired = self._clip_joint_limits_hw(desired_hw)
         left_g_idx = rokae_constants.ARM_DOF
         right_g_idx = rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF
         desired[left_g_idx] = np.clip(desired[left_g_idx], rokae_constants.GRIPPER_CLOSE_M, rokae_constants.GRIPPER_OPEN_M)
         desired[right_g_idx] = np.clip(desired[right_g_idx], rokae_constants.GRIPPER_CLOSE_M, rokae_constants.GRIPPER_OPEN_M)
-        reference = self._last_sent
+        reference = self._last_sent_hw
         if reference is None:
-            reference = self.get_observation((1, 1), "")["state"]
+            reference = self._get_hardware_state()
         max_dq = float(self._args.policy_max_delta_rad)
         max_dg = float(self._args.policy_max_delta_gripper_m)
         limited = desired.copy()
-        for slc in (
-            slice(0, rokae_constants.ARM_DOF),
-            slice(rokae_constants.SINGLE_ARM_ACTION_DIM, rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF),
-        ):
+        for slc in self._joint_slices():
             limited[slc] = reference[slc] + np.clip(desired[slc] - reference[slc], -max_dq, max_dq)
-        for idx in (left_g_idx, right_g_idx):
+        for idx in self._gripper_indices():
             limited[idx] = np.clip(reference[idx] + np.clip(desired[idx] - reference[idx], -max_dg, max_dg),
                                    rokae_constants.GRIPPER_CLOSE_M, rokae_constants.GRIPPER_OPEN_M)
         return limited
 
     def reset_control_state(self) -> None:
         with self._lock:
-            self._last_sent = None
+            self._last_sent_hw = None
 
 
 class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
@@ -207,21 +256,22 @@ class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
             else self._system.env_driver.full_task_reset_action
         )
         if target_raw is not None:
-            target = np.asarray(target_raw, dtype=np.float32).reshape(-1)
-            if target.shape[0] == rokae_constants.DUAL_ACTION_DIM:
-                left_q = target[: rokae_constants.ARM_DOF]
+            target_policy = np.asarray(target_raw, dtype=np.float32).reshape(-1)
+            if target_policy.shape[0] == rokae_constants.DUAL_ACTION_DIM:
+                target_hw = self._robot._clip_joint_limits_hw(self._robot._policy_to_hardware_units(target_policy))
+                left_q = target_hw[: rokae_constants.ARM_DOF]
                 right_base = rokae_constants.SINGLE_ARM_ACTION_DIM
-                right_q = target[right_base : right_base + rokae_constants.ARM_DOF]
+                right_q = target_hw[right_base : right_base + rokae_constants.ARM_DOF]
                 self._robot._arms.move_j(
                     np.concatenate([left_q, right_q], dtype=np.float32),
                     wait=True,
                     timeout=60.0,
                     restore_realtime=True,
                 )
-                self._robot._left_gripper.set_opening_m(float(target[rokae_constants.ARM_DOF]))
-                self._robot._right_gripper.set_opening_m(float(target[right_base + rokae_constants.ARM_DOF]))
+                self._robot._left_gripper.set_opening_m(float(target_hw[rokae_constants.ARM_DOF]))
+                self._robot._right_gripper.set_opening_m(float(target_hw[right_base + rokae_constants.ARM_DOF]))
             else:
-                raise ValueError(f"Dual Rokae reset action must be 16D if configured, got {target.shape[0]}")
+                raise ValueError(f"Dual Rokae reset action must be 16D if configured, got {target_policy.shape[0]}")
         else:
             self._robot._arms.move_j_pose(
                 np.asarray(rokae_constants.LEFT_RESET_END_POSE, dtype=np.float32),
