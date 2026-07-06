@@ -80,6 +80,57 @@ def _infer_robot_action_dim(
     return int(actions.shape[-1])
 
 
+def _make_fake_images(*, use_tactile: bool = False) -> dict[str, np.ndarray]:
+    """Camera superset used by startup validation across supported robot configs."""
+    fake_images = {
+        "cam_front": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_high": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_left_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
+        "cam_right_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
+    }
+    if use_tactile:
+        fake_images.update(
+            {
+                "tactile_left": np.zeros((224, 224, 3), dtype=np.uint8),
+                "tactile_right": np.zeros((224, 224, 3), dtype=np.uint8),
+            }
+        )
+    return fake_images
+
+
+def _infer_robot_state_dim(
+    input_transforms: Sequence[_transforms.DataTransformFn],
+    *,
+    fake_images: dict[str, np.ndarray],
+    action_dim: int,
+    model_action_dim: int,
+) -> int:
+    """Infer the pre-transform robot state dimension expected by data transforms."""
+    candidates = []
+    for dim in (action_dim, model_action_dim, 16, 14, 8, 7):
+        dim = int(dim)
+        if dim > 0 and dim not in candidates:
+            candidates.append(dim)
+
+    transform = _transforms.compose(input_transforms)
+    failures: dict[int, str] = {}
+    for dim in candidates:
+        fake = {
+            "images": fake_images,
+            "state": np.zeros(dim, dtype=np.float32),
+            "prompt": "test prompt",
+        }
+        try:
+            transform(fake)
+            return dim
+        except Exception as exc:
+            failures[dim] = str(exc)
+
+    failure_text = "; ".join(f"{dim}D: {msg}" for dim, msg in failures.items())
+    raise ValueError(f"Could not infer startup fake state dimension from input transforms ({failure_text})")
+
+
 class RLTInferenceModel(nnx.Module):
     """Combined VLA + RLT model for inference. Outputs both actions and RL tokens."""
 
@@ -392,7 +443,21 @@ def main(args: Args) -> None:
         model_action_horizon=chunk_len,
         model_action_dim=int(config.model.action_dim),
     )
-    proprio_dim = action_dim
+    use_tactile = bool(getattr(config.model, "use_tactile", False))
+    fake_images = _make_fake_images(use_tactile=use_tactile)
+    proprio_dim = _infer_robot_state_dim(
+        data_config.data_transforms.inputs,
+        fake_images=fake_images,
+        action_dim=action_dim,
+        model_action_dim=int(config.model.action_dim),
+    )
+    logging.info(
+        "Inferred server dims: pre_transform_state_dim=%s, action_dim=%s, chunk_len=%s, z_dim=%s",
+        proprio_dim,
+        action_dim,
+        chunk_len,
+        z_dim,
+    )
 
     policy = RLTPolicy(
         model,
@@ -407,7 +472,7 @@ def main(args: Args) -> None:
             "action_dim": action_dim,
             "supports_batch": True,
             "shared_prefix_inference": args.shared_prefix_inference,
-            "use_tactile": bool(getattr(config.model, "use_tactile", False)),
+            "use_tactile": use_tactile,
         },
         z_dim=z_dim,
         proprio_dim=proprio_dim,
@@ -419,20 +484,6 @@ def main(args: Args) -> None:
     logging.info("Testing single inference...")
     # Include common data-level camera keys so startup validation works across
     # Dobot/VitAI-style configs and dual Rokae configs.
-    fake_images = {
-        "cam_front": np.zeros((224, 224, 3), dtype=np.uint8),
-        "cam_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
-        "cam_high": np.zeros((224, 224, 3), dtype=np.uint8),
-        "cam_left_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
-        "cam_right_wrist": np.zeros((224, 224, 3), dtype=np.uint8),
-    }
-    if getattr(config.model, "use_tactile", False):
-        fake_images.update(
-            {
-                "tactile_left": np.zeros((224, 224, 3), dtype=np.uint8),
-                "tactile_right": np.zeros((224, 224, 3), dtype=np.uint8),
-            }
-        )
     fake_dict = {
         "images": fake_images,
         "state": np.zeros(proprio_dim, dtype=np.float32),

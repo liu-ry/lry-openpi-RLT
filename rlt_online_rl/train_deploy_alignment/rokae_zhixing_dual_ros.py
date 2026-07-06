@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """RLT rollout entrypoint for dual Rokae AR arms with Zhixing grippers.
 
-This is the robot-side process analogous to dobot_umi_ros.py, but without UMI
-human override. It reuses the generic PikaChunkEnvAdapter/EnvDriver stack and
-provides a dual-arm SDK bridge.
+This is the robot-side process analogous to dobot_umi_ros.py. It reuses the
+generic PikaChunkEnvAdapter/EnvDriver stack, provides a dual-arm SDK bridge,
+and supports UMI topic based human takeover for DAgger data collection.
 """
 # ruff: noqa
 from __future__ import annotations
@@ -20,6 +20,9 @@ from typing import Any
 import numpy as np
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import JointState
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT_OUTER = REPO_ROOT.parent
@@ -56,6 +59,7 @@ from pika_sync_ros import (
     RolloutRuntimeContext,
     StaticOnlinePhaseController,
     TaskState,
+    TeleopTriggerNode,
     _bind_runtime_hook,
     _default_done_fn,
     _default_reward_fn,
@@ -71,11 +75,146 @@ from rlt_online_rl.runtime_logging import metrics_path_for, setup_process_loggin
 
 logger = logging.getLogger("rokae_zhixing_dual_ros")
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "tasks" / "rokae_zhixing_dual" / "online_rl.yaml"
+DEFAULT_TELEOP_TRIGGER_SVC = "/umi/teleop_trigger"
+DEFAULT_UMI_COMBINED_ACTION_TOPIC = "/umi/human_action"
+DEFAULT_UMI_LEFT_ACTION_TOPIC = "/umi/left_human_action"
+DEFAULT_UMI_RIGHT_ACTION_TOPIC = "/umi/right_human_action"
 
 
 class NullHumanActionRecorder:
     def snapshot_latest(self) -> tuple[np.ndarray | None, int]:
         return None, -1
+
+
+class UMIJointActionRecorder(Node):
+    """Subscribe UMI teleop JointState topics and expose the latest 16D Rokae action.
+
+    Supported topic layouts:
+      - combined topic: JointState.position has 16D
+        [left_j1..left_j7, left_gripper, right_j1..right_j7, right_gripper]
+      - split topics: each JointState.position has 8D [j1..j7, gripper].
+
+    The rollout policy/replay units for Rokae are degrees/mm. If the UMI side
+    publishes hardware units (rad/m), pass --umi_action_units hardware_rad_m.
+    The default auto mode treats small joint magnitudes plus sub-meter gripper
+    values as hardware units and converts them.
+    """
+
+    def __init__(
+        self,
+        *,
+        combined_topic: str | None,
+        left_topic: str | None,
+        right_topic: str | None,
+        action_units: str,
+    ) -> None:
+        super().__init__("rokae_umi_joint_action_recorder")
+        self._lock = threading.Lock()
+        self._action_units = action_units
+        self._latest_action: np.ndarray | None = None
+        self._latest_seq = -1
+        self._left_action: np.ndarray | None = None
+        self._right_action: np.ndarray | None = None
+
+        if combined_topic:
+            self.create_subscription(JointState, combined_topic, self._on_combined, qos_profile_sensor_data)
+            self.get_logger().info(f"UMI combined dual-arm action topic: {combined_topic}")
+        if left_topic:
+            self.create_subscription(JointState, left_topic, self._on_left, qos_profile_sensor_data)
+            self.get_logger().info(f"UMI left action topic: {left_topic}")
+        if right_topic:
+            self.create_subscription(JointState, right_topic, self._on_right, qos_profile_sensor_data)
+            self.get_logger().info(f"UMI right action topic: {right_topic}")
+        if not combined_topic and not (left_topic and right_topic):
+            raise ValueError("UMI teleop requires either --umi_combined_action_topic or both left/right topics")
+
+    def _convert_units_if_needed(self, action16: np.ndarray) -> np.ndarray:
+        action = np.asarray(action16, dtype=np.float32).reshape(-1)[: rokae_constants.DUAL_ACTION_DIM]
+        units = self._action_units
+        if units == "auto":
+            joint_values = np.concatenate(
+                [
+                    action[: rokae_constants.ARM_DOF],
+                    action[
+                        rokae_constants.SINGLE_ARM_ACTION_DIM :
+                        rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF
+                    ],
+                ],
+                dtype=np.float32,
+            )
+            gripper_values = np.asarray(
+                [
+                    action[rokae_constants.ARM_DOF],
+                    action[rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF],
+                ],
+                dtype=np.float32,
+            )
+            looks_like_hardware = (
+                float(np.nanmax(np.abs(joint_values))) <= (2.0 * np.pi + 1e-3)
+                and float(np.nanmax(np.abs(gripper_values))) <= 0.2
+            )
+            units = "hardware_rad_m" if looks_like_hardware else "policy_deg_mm"
+        if units == "hardware_rad_m":
+            return DualRokaeRobotBridge._hardware_to_policy_units(action)
+        if units == "policy_deg_mm":
+            return action.copy()
+        raise ValueError(f"Unsupported umi_action_units={self._action_units!r}")
+
+    def _publish_latest_locked(self, action16: np.ndarray) -> None:
+        action = self._convert_units_if_needed(action16)
+        if not np.all(np.isfinite(action)):
+            self.get_logger().warning("Ignoring UMI action containing NaN/Inf")
+            return
+        self._latest_action = action
+        self._latest_seq += 1
+
+    def _on_combined(self, msg: JointState) -> None:
+        action = np.asarray(msg.position, dtype=np.float32).reshape(-1)
+        if action.shape[0] < rokae_constants.DUAL_ACTION_DIM:
+            self.get_logger().warning(f"Combined UMI action dim < 16: {action.shape[0]}")
+            return
+        with self._lock:
+            self._publish_latest_locked(action[: rokae_constants.DUAL_ACTION_DIM])
+
+    def _on_left(self, msg: JointState) -> None:
+        action = np.asarray(msg.position, dtype=np.float32).reshape(-1)
+        if action.shape[0] < rokae_constants.SINGLE_ARM_ACTION_DIM:
+            self.get_logger().warning(f"Left UMI action dim < 8: {action.shape[0]}")
+            return
+        with self._lock:
+            self._left_action = action[: rokae_constants.SINGLE_ARM_ACTION_DIM].copy()
+            if self._right_action is not None:
+                self._publish_latest_locked(np.concatenate([self._left_action, self._right_action], dtype=np.float32))
+
+    def _on_right(self, msg: JointState) -> None:
+        action = np.asarray(msg.position, dtype=np.float32).reshape(-1)
+        if action.shape[0] < rokae_constants.SINGLE_ARM_ACTION_DIM:
+            self.get_logger().warning(f"Right UMI action dim < 8: {action.shape[0]}")
+            return
+        with self._lock:
+            self._right_action = action[: rokae_constants.SINGLE_ARM_ACTION_DIM].copy()
+            if self._left_action is not None:
+                self._publish_latest_locked(np.concatenate([self._left_action, self._right_action], dtype=np.float32))
+
+    def snapshot_latest(self) -> tuple[np.ndarray | None, int]:
+        with self._lock:
+            if self._latest_action is None:
+                return None, self._latest_seq
+            return self._latest_action.copy(), self._latest_seq
+
+
+class RokaeUMITeleopTriggerNode(TeleopTriggerNode):
+    """Teleop toggle node that resets Rokae teleop command filters on entry."""
+
+    def __init__(self, *args, robot_bridge: "DualRokaeRobotBridge", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._robot_bridge = robot_bridge
+
+    def _on_trigger(self, request, response):
+        response = super()._on_trigger(request, response)
+        if response.success and "mode=teleop" in response.message:
+            self._robot_bridge.reset_teleop_state()
+        return response
 
 
 class DualRokaeRobotBridge:
@@ -198,7 +337,7 @@ class DualRokaeRobotBridge:
             "prompt": task,
         }
 
-    def send_action(self, action16: np.ndarray) -> np.ndarray:
+    def send_action(self, action16: np.ndarray, *, _source: str = "policy") -> np.ndarray:
         action_policy = np.asarray(action16, dtype=np.float32).reshape(-1)
         if action_policy.shape[0] < rokae_constants.DUAL_ACTION_DIM:
             raise ValueError(f"Expected 16D dual Rokae action, got {action_policy.shape}")
@@ -208,7 +347,7 @@ class DualRokaeRobotBridge:
             raise ValueError("Action contains NaN or Inf")
         with self._lock:
             desired_hw = self._policy_to_hardware_units(action_policy)
-            limited_hw = self._limit_action(desired_hw)
+            limited_hw = self._limit_action(desired_hw, source=_source)
             left_q = limited_hw[: rokae_constants.ARM_DOF]
             left_g = float(limited_hw[rokae_constants.ARM_DOF])
             right_base = rokae_constants.SINGLE_ARM_ACTION_DIM
@@ -220,7 +359,7 @@ class DualRokaeRobotBridge:
             self._last_sent_hw = limited_hw.copy()
             return self._hardware_to_policy_units(limited_hw)
 
-    def _limit_action(self, desired_hw: np.ndarray) -> np.ndarray:
+    def _limit_action(self, desired_hw: np.ndarray, *, source: str = "policy") -> np.ndarray:
         desired = self._clip_joint_limits_hw(desired_hw)
         left_g_idx = rokae_constants.ARM_DOF
         right_g_idx = rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF
@@ -229,8 +368,12 @@ class DualRokaeRobotBridge:
         reference = self._last_sent_hw
         if reference is None:
             reference = self._get_hardware_state()
-        max_dq = float(self._args.policy_max_delta_rad)
-        max_dg = float(self._args.policy_max_delta_gripper_m)
+        if source == "teleop":
+            max_dq = float(getattr(self._args, "teleop_max_delta_rad", self._args.policy_max_delta_rad))
+            max_dg = float(getattr(self._args, "teleop_max_delta_gripper_m", self._args.policy_max_delta_gripper_m))
+        else:
+            max_dq = float(self._args.policy_max_delta_rad)
+            max_dg = float(self._args.policy_max_delta_gripper_m)
         limited = desired.copy()
         for slc in self._joint_slices():
             limited[slc] = reference[slc] + np.clip(desired[slc] - reference[slc], -max_dq, max_dq)
@@ -243,11 +386,14 @@ class DualRokaeRobotBridge:
         with self._lock:
             self._last_sent_hw = None
 
+    def reset_teleop_state(self) -> None:
+        self.reset_control_state()
+
 
 class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
     def _sample_latest_human_action(self, observation) -> np.ndarray:
-        # Human override is intentionally not implemented for dual Rokae yet.
-        return np.asarray(observation["state"], dtype=np.float32)[: self._system.rl.action_dim]
+        action = super()._sample_latest_human_action(observation)
+        return self._robot.send_action(action, _source="teleop")
 
     def _reset_robot_to_mode_start(self) -> None:
         target_raw = (
@@ -330,6 +476,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--policy_max_delta_rad", type=float, default=rokae_constants.MAX_JOINT_DELTA_RAD)
     parser.add_argument("--policy_max_delta_gripper_m", type=float, default=rokae_constants.MAX_GRIPPER_DELTA_M)
+    parser.add_argument("--teleop_max_delta_rad", type=float, default=0.05)
+    parser.add_argument("--teleop_max_delta_gripper_m", type=float, default=rokae_constants.GRIPPER_OPEN_M)
+    parser.add_argument("--teleop_trigger_service", type=str, default=DEFAULT_TELEOP_TRIGGER_SVC)
+    parser.add_argument("--policy_resume_delay_s", type=float, default=1.0)
+    parser.add_argument("--start_in_human_mode", action="store_true")
+    parser.add_argument("--disable_human_override", action="store_true")
+    parser.add_argument("--umi_combined_action_topic", type=str, default=DEFAULT_UMI_COMBINED_ACTION_TOPIC)
+    parser.add_argument("--umi_left_action_topic", type=str, default=DEFAULT_UMI_LEFT_ACTION_TOPIC)
+    parser.add_argument("--umi_right_action_topic", type=str, default=DEFAULT_UMI_RIGHT_ACTION_TOPIC)
+    parser.add_argument(
+        "--umi_action_units",
+        choices=("auto", "policy_deg_mm", "hardware_rad_m"),
+        default="auto",
+        help="Units published by UMI JointState.position. Rokae policy/replay units are deg/mm.",
+    )
     parser.add_argument("--require_online_approval", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--step_trace_stride", type=int, default=None)
     parser.add_argument("--eval_actor_only", action="store_true")
@@ -353,7 +514,7 @@ def main() -> None:
             system.env_driver,
             actor_deterministic=effective_actor_deterministic,
             step_trace_stride=effective_step_trace_stride,
-            enable_human_override=False,
+            enable_human_override=False if args.disable_human_override else system.env_driver.enable_human_override,
         ),
     )
     log_path = setup_process_logging("rokae_zhixing_dual_ros", system, console_level=logging.INFO)
@@ -365,7 +526,7 @@ def main() -> None:
 
     rclpy.init(domain_id=args.ros_domain_id) if args.ros_domain_id is not None else rclpy.init()
     task_state = TaskState(args.task)
-    intervention_state = HumanInterventionState(policy_enabled=True)
+    intervention_state = HumanInterventionState(policy_enabled=not args.start_in_human_mode)
 
     arms = rokae_utils.DualRokaeArm(
         left=rokae_utils.RokaeSDKArm(
@@ -413,6 +574,23 @@ def main() -> None:
         raise RuntimeError("right gripper initialization failed")
 
     robot = DualRokaeRobotBridge(args, arms, left_gripper, right_gripper, image_recorder)
+    human_action_recorder = (
+        NullHumanActionRecorder()
+        if args.disable_human_override
+        else UMIJointActionRecorder(
+            combined_topic=args.umi_combined_action_topic or None,
+            left_topic=args.umi_left_action_topic or None,
+            right_topic=args.umi_right_action_topic or None,
+            action_units=args.umi_action_units,
+        )
+    )
+    teleop_node = RokaeUMITeleopTriggerNode(
+        intervention_state=intervention_state,
+        service_name=args.teleop_trigger_service,
+        resume_delay_s=args.policy_resume_delay_s,
+        gripper_streamer=None,
+        robot_bridge=robot,
+    )
     runtime_context = RolloutRuntimeContext(
         system=system,
         obs_node=None,  # type: ignore[arg-type]
@@ -421,7 +599,9 @@ def main() -> None:
         robot=robot,  # type: ignore[arg-type]
     )
     manual_signal_bridge = ManualSignalBridge()
-    nodes = []
+    nodes: list[Node] = [teleop_node]
+    if isinstance(human_action_recorder, Node):
+        nodes.append(human_action_recorder)
     nodes.extend(_bind_runtime_hook(manual_signal_bridge, runtime_context))
     nodes.extend(_bind_runtime_hook(reward_fn, runtime_context))
     nodes.extend(_bind_runtime_hook(success_fn, runtime_context))
@@ -470,7 +650,7 @@ def main() -> None:
         robot=robot,  # type: ignore[arg-type]
         task_state=task_state,
         intervention_state=intervention_state,
-        human_action_recorder=NullHumanActionRecorder(),  # type: ignore[arg-type]
+        human_action_recorder=human_action_recorder,  # type: ignore[arg-type]
         phase_controller=phase_controller,  # type: ignore[arg-type]
         runtime_context=runtime_context,
         reward_fn=reward_fn,
@@ -495,6 +675,15 @@ def main() -> None:
     )
 
     logger.info("Starting dual Rokae rollout log=%s config=%s", log_path, args.config)
+    logger.info("Teleop services trigger=%s status=/teleop_status", args.teleop_trigger_service)
+    if not args.disable_human_override:
+        logger.info(
+            "UMI teleop topics combined=%s left=%s right=%s units=%s",
+            args.umi_combined_action_topic,
+            args.umi_left_action_topic,
+            args.umi_right_action_topic,
+            args.umi_action_units,
+        )
     logger.info("Manual services next=%s success=%s failure=%s done=%s critical=%s toggle=%s actor=%s base=%s",
                 REQUEST_NEXT_EPISODE_SERVICE, RECORD_SUCCESS_SERVICE, RECORD_FAILURE_SERVICE,
                 RECORD_DONE_SERVICE, ENTER_CRITICAL_PHASE_SERVICE, TOGGLE_CRITICAL_PHASE_SERVICE,

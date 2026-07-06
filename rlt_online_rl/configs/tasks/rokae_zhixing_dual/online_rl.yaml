@@ -76,14 +76,14 @@ runtime:
     recent_episode_window: 20
     recent_online_ratio: 0.3
     warmup_demo_ratio: 0.3
-    human_intervention_ratio: 0.0
+    human_intervention_ratio: 0.3
 
   env_driver:
     machine_a_ws_url: ws://192.168.3.5:8099
     actor_service_url: http://127.0.0.1:9101
     replay_service_url: http://127.0.0.1:9102
 
-    # No UMI/manual override path is implemented for dual Rokae yet.
+    # UMI/manual override is handled by rokae_zhixing_dual_ros.py via JointState topics.
     task_mode: critical_phase
     episode_start_control_mode: policy
 
@@ -114,7 +114,9 @@ runtime:
     auto_critical_phase_enter_threshold: 0.75
     auto_critical_phase_exit_threshold: 0.25
 
-    enable_human_override: false
+    # UMI 人为介入使能。rokae_zhixing_dual_ros.py 默认提供
+    # /umi/teleop_trigger 和 /teleop_status，键盘脚本与 dobot_umi 保持一致。
+    enable_human_override: true
     safe_fallback_to_ref: true
 
     machine_a_connect_timeout_sec: 5.0
