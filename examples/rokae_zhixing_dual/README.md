@@ -29,7 +29,7 @@ Hardware check:
 ```bash
 python examples/rokae_zhixing_dual/check_hardware.py
 python examples/rokae_zhixing_dual/check_hardware.py --gripper_test
-python examples/rokae_zhixing_dual/check_hardware.py --skip_tactile
+python examples/rokae_zhixing_dual/check_hardware.py --check_tactile
 ```
 
 The arm check is read-only: it creates `pyrokae.RokaeAR` and reads state, joint position, velocity, and end pose. It does not power on, change mode, or send motion commands.

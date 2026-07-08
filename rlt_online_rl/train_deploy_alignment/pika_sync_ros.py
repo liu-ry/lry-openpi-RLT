@@ -1179,8 +1179,17 @@ class PikaChunkEnvAdapter:
             if limits.shape[0] != system.rl.action_dim:
                 raise ValueError(f"action_delta_limits must have {system.rl.action_dim} entries, got {limits.shape[0]}")
             self._action_delta_limits = limits
+        observation_capture_interval = int(getattr(system.env_driver, "observation_capture_interval", 1))
+        if observation_capture_interval > 1:
+            logger.info(
+                "Chunk execution decouples servo ticks from observation capture: control_hz=%.2f "
+                "observation_capture_interval=%d",
+                float(system.env_driver.control_frequency_hz),
+                observation_capture_interval,
+            )
         self._auto_critical_gate = self._create_auto_critical_gate()
         self._last_observed_critical = self._runtime_context.in_critical_phase()
+        self._reset_done_for_next_episode = False
 
     def reset(self) -> dict[str, Any]:
         self._episode_chunk_step = 0
@@ -1193,7 +1202,10 @@ class PikaChunkEnvAdapter:
         self._intervention_state.enter_episode_reset()
         self._runtime_context.reset_episode_state()
         self._robot.wait_for_observation_ready(timeout_s=self._obs_ready_timeout_s)
-        self._reset_robot_to_mode_start()
+        if self._reset_done_for_next_episode:
+            logger.info("Robot already reset at previous episode end; skipping duplicate reset.")
+        else:
+            self._reset_robot_to_mode_start()
         self._phase_controller.begin_episode()
         logger.info("Waiting for next episode request task_mode=%s", self._task_mode)
         self._runtime_context.wait_for_next_episode_request()
@@ -1202,7 +1214,17 @@ class PikaChunkEnvAdapter:
         self._apply_episode_start_control_mode()
         observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
         self._last_observed_critical = self._runtime_context.in_critical_phase()
+        self._reset_done_for_next_episode = False
         return observation
+
+    def _finish_episode_and_reset_robot(self) -> None:
+        self._intervention_state.enter_episode_reset()
+        self._phase_controller.finish_episode()
+        logger.info("Episode finished; resetting robot to mode start pose now.")
+        self._reset_robot_to_mode_start()
+        self._last_sent_action = None
+        self._last_human_action = None
+        self._reset_done_for_next_episode = True
 
     def current_phase_name(self) -> str:
         segment = "critical" if self._runtime_context.in_critical_phase() else "base"
@@ -1316,6 +1338,10 @@ class PikaChunkEnvAdapter:
         phase = self._phase_controller.episode_phase
         period = 1.0 / max(float(control_hz), 1e-6)
         horizon = int(self._system.env_driver.chunk_exec_horizon)
+        observation_capture_interval = max(
+            int(getattr(self._system.env_driver, "observation_capture_interval", 1)),
+            1,
+        )
 
         observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
         critical_started = self._update_auto_critical_gate(
@@ -1333,6 +1359,9 @@ class PikaChunkEnvAdapter:
         chunk_start_features = None
         current_plan: PolicyPlan | None = None
         plan_cursor = 0
+        captured_observation_count = 1
+        control_overrun_count = 0
+        control_overrun_max_s = 0.0
 
         for local_step in range(horizon):
             if self._manual_terminal_requested():
@@ -1383,17 +1412,40 @@ class PikaChunkEnvAdapter:
                 human_controlled.append(True)
                 step_sources.append(int(TransitionSource.HUMAN))
                 actor_param_versions.append(-1)
-            step_observations.append(self._robot.get_observation(self._resize_hw, self._task_state.get()))
+            should_capture_observation = (
+                local_step == horizon - 1
+                or ((local_step + 1) % observation_capture_interval == 0)
+                or self._manual_terminal_requested()
+            )
+            if should_capture_observation:
+                step_observations.append(self._robot.get_observation(self._resize_hw, self._task_state.get()))
+                captured_observation_count += 1
+            else:
+                step_observations.append(step_observations[-1])
             elapsed = time.perf_counter() - tick_start
             remaining = period - elapsed
             if remaining > 0:
                 time.sleep(remaining)
+            else:
+                control_overrun_count += 1
+                control_overrun_max_s = max(control_overrun_max_s, -remaining)
 
         next_observation = (
             step_observations[-1]
             if step_observations
             else self._robot.get_observation(self._resize_hw, self._task_state.get())
         )
+        if control_overrun_count:
+            logger.warning(
+                "Chunk control loop overran target period %.4fs on %d/%d ticks; max_overrun=%.4fs "
+                "observation_capture_interval=%d captured_observations=%d",
+                period,
+                control_overrun_count,
+                len(executed),
+                control_overrun_max_s,
+                observation_capture_interval,
+                captured_observation_count,
+            )
         self._record_auto_critical_samples(step_observations, label=critical_started)
         signal_snapshot = self._runtime_context.snapshot_signals()
         context = {
@@ -1405,6 +1457,10 @@ class PikaChunkEnvAdapter:
             "critical_started": critical_started,
             "runtime": self._runtime_context,
             "signals": signal_snapshot,
+            "observation_capture_interval": observation_capture_interval,
+            "captured_observation_count": captured_observation_count,
+            "control_overrun_count": control_overrun_count,
+            "control_overrun_max_s": control_overrun_max_s,
         }
         rewards = _coerce_reward_output(
             self._reward_fn(observation, np.asarray(executed, dtype=np.float32), next_observation, context),
@@ -1439,8 +1495,7 @@ class PikaChunkEnvAdapter:
         if not executed:
             self._last_sent_action = None
             if terminal_requested:
-                self._intervention_state.enter_episode_reset()
-                self._phase_controller.finish_episode()
+                self._finish_episode_and_reset_robot()
             return (
                 next_observation,
                 rewards,
@@ -1460,8 +1515,7 @@ class PikaChunkEnvAdapter:
         self._episode_chunk_step += 1
         done = bool(terminal_requested or (self._episode_chunk_step >= self._max_chunk_steps_per_episode))
         if done:
-            self._intervention_state.enter_episode_reset()
-            self._phase_controller.finish_episode()
+            self._finish_episode_and_reset_robot()
         if step_trace:
             step_trace[-1]["done"] = done
         if human_intervened:

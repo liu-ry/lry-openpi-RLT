@@ -1,7 +1,7 @@
 experiment:
   rl:
-    # 16D policy/RLT units: left_j1..left_j7 deg, left_gripper_mm,
-    # right_j1..right_j7 deg, right_gripper_mm.
+    # 16D policy/RLT units: left_j1..left_j7 deg, left_gripper_raw/100,
+    # right_j1..right_j7 deg, right_gripper_raw/100.
     action_dim: 16
     chunk_len: 50
     z_dim: 2048
@@ -29,7 +29,7 @@ experiment:
     target_tau: 0.005
     actor_update_period: 2
 
-    warmup_min_size: 1000
+    warmup_min_size: 10000
     warmup_post_collect_updates: 10000
     freeze_after_warmup: false
     grad_updates_per_cycle: 5
@@ -88,15 +88,25 @@ runtime:
     episode_start_control_mode: policy
 
     # 16D reset action in dataset/RLT units:
-    # [left joints deg, left gripper mm, right joints deg, right gripper mm].
+    # [left joints deg, left gripper_raw/100, right joints deg, right gripper_raw/100].
+    # Gripper values follow dataset conversion: SDK raw position divided by 100.
     # If left null, rokae_zhixing_dual_ros.py uses
     # examples/rokae_zhixing_dual/constants.py LEFT/RIGHT_RESET_END_POSE and IK.
-    full_task_reset_action: null
-    critical_phase_reset_action: null
+    # Match the converted training-set initial gripper state instead of raw 0,
+    # which is out of distribution and makes VLA immediately pull the grippers closed.
+    full_task_reset_action: [-86.965, -30.498, 106.409, 99.709, 44.431, 30.097, -12.905, 26.06, 82.634, -33.864, -107.351, 99.859, -47.919, 26.951, 4.574, 20.58]
+    critical_phase_reset_action: [-86.965, -30.498, 106.409, 99.709, 44.431, 30.097, -12.905, 26.06, 82.634, -33.864, -107.351, 99.859, -47.919, 26.951, 4.574, 20.58]
 
     actor_deterministic: false
     chunk_exec_horizon: 30
     control_frequency_hz: 30.0
+
+    # Smooth Machine A / VLA ref_chunk before direct execution and before the
+    # local RLT actor consumes it. Only arm joints are smoothed; grippers stay raw.
+    ref_chunk_smoothing_alpha: 0.8
+    ref_chunk_smoothing_passes: 1
+    ref_chunk_smoothing_indices: [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+    observation_capture_interval: 10
 
     step_trace_stride: 0
     replay_feature_batch_size: 16

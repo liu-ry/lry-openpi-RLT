@@ -9,7 +9,7 @@ Checks:
 Examples:
     python examples/rokae_zhixing_dual/check_hardware.py
     python examples/rokae_zhixing_dual/check_hardware.py --gripper_test
-    python examples/rokae_zhixing_dual/check_hardware.py --skip_tactile
+    python examples/rokae_zhixing_dual/check_hardware.py --check_tactile
     python examples/rokae_zhixing_dual/check_hardware.py --skip_arm --skip_gripper
 """
 # ruff: noqa
@@ -61,6 +61,13 @@ def _title(msg: str) -> str:
 
 def _load_pyrokae(sdk_python_dir: str) -> Any:
     sdk_dir = Path(sdk_python_dir)
+    if sys.version_info[:2] != (3, 10):
+        print(_fail(
+            "pyrokae SDK requires CPython 3.10, but current Python is "
+            f"{sys.version.split()[0]}"
+        ))
+        print(_warn("Use the rlt_online_rl310 environment or rebuild the Rokae SDK for this Python."))
+        return None
     if str(sdk_dir) not in sys.path:
         sys.path.insert(0, str(sdk_dir))
     try:
@@ -432,7 +439,8 @@ def main() -> None:
     parser.add_argument("--skip_arm", action="store_true")
     parser.add_argument("--skip_gripper", action="store_true")
     parser.add_argument("--skip_cameras", action="store_true")
-    parser.add_argument("--skip_tactile", action="store_true")
+    parser.add_argument("--check_tactile", action="store_true", help="Check VitAI tactile sensors. Skipped by default.")
+    parser.add_argument("--skip_tactile", action="store_true", help="Deprecated; tactile checks are skipped by default.")
     args = parser.parse_args()
 
     print(f"\n{'=' * 72}")
@@ -462,9 +470,9 @@ def main() -> None:
     else:
         results["cameras"] = check_cameras(args)
 
-    if args.skip_tactile:
+    if not args.check_tactile or args.skip_tactile:
         print(_title("[4] VitAI GF225 tactile sensors"))
-        print(_warn("skipped by --skip_tactile"))
+        print(_warn("skipped; add --check_tactile to enable"))
         results["tactile"] = None
     else:
         results["tactile"] = check_tactile(args)

@@ -160,6 +160,46 @@ def _coerce_ref_chunk(ref_chunk: Any, *, min_chunk_len: int, min_action_dim: int
     return array
 
 
+def _smooth_ref_chunk(
+    ref_chunk: np.ndarray,
+    env_config: EnvDriverConfig | None,
+    *,
+    action_dim: int,
+) -> np.ndarray:
+    if env_config is None:
+        return ref_chunk
+    alpha = float(getattr(env_config, "ref_chunk_smoothing_alpha", 1.0))
+    if alpha >= 1.0:
+        return ref_chunk
+    if alpha <= 0.0:
+        raise ValueError("env_driver.ref_chunk_smoothing_alpha must be in (0, 1].")
+    passes = int(getattr(env_config, "ref_chunk_smoothing_passes", 1))
+    if passes < 1:
+        return ref_chunk
+    indices = getattr(env_config, "ref_chunk_smoothing_indices", None)
+    if indices is None:
+        smooth_indices = np.arange(action_dim, dtype=np.int64)
+    else:
+        smooth_indices = np.asarray(indices, dtype=np.int64)
+        if smooth_indices.ndim != 1:
+            raise ValueError("env_driver.ref_chunk_smoothing_indices must be a 1D list of action indices.")
+        if np.any(smooth_indices < 0) or np.any(smooth_indices >= action_dim):
+            raise ValueError(
+                f"env_driver.ref_chunk_smoothing_indices must be within [0, {action_dim}), got {indices}."
+            )
+    if smooth_indices.size == 0 or ref_chunk.shape[0] <= 1:
+        return ref_chunk
+
+    smoothed = np.asarray(ref_chunk, dtype=np.float32).copy()
+    for _ in range(passes):
+        for t in range(1, smoothed.shape[0]):
+            smoothed[t, smooth_indices] = (
+                alpha * smoothed[t, smooth_indices]
+                + (1.0 - alpha) * smoothed[t - 1, smooth_indices]
+            )
+    return smoothed
+
+
 def _proprio_from_observation(observation: dict[str, Any], rl_config: RLTOnlineRLConfig) -> np.ndarray:
     if "state" not in observation:
         raise ValueError("observation missing required key 'state'.")
@@ -178,6 +218,7 @@ def normalize_feature_payload(
     rl_config: RLTOnlineRLConfig,
     *,
     observation: dict[str, Any],
+    env_config: EnvDriverConfig | None = None,
 ) -> dict[str, Any]:
     required = {"z_rl", "ref_chunk"}
     missing = sorted(required - set(payload))
@@ -187,11 +228,12 @@ def normalize_feature_payload(
     normalized = dict(payload)
     normalized["z_rl"] = _coerce_feature_vector("z_rl", payload["z_rl"], rl_config.z_dim)
     normalized["proprio"] = _proprio_from_observation(observation, rl_config)
-    normalized["ref_chunk"] = _coerce_ref_chunk(
+    ref_chunk = _coerce_ref_chunk(
         payload["ref_chunk"],
         min_chunk_len=rl_config.chunk_len,
         min_action_dim=rl_config.action_dim,
     )[: rl_config.chunk_len, : rl_config.action_dim]
+    normalized["ref_chunk"] = _smooth_ref_chunk(ref_chunk, env_config, action_dim=rl_config.action_dim)
     return normalized
 
 
@@ -738,6 +780,14 @@ class EnvDriver:
         self._safe_action_filter = safe_action_filter
         self._human_override_fn = human_override_fn
         self._metrics_path = metrics_path
+        smoothing_alpha = float(getattr(env_config, "ref_chunk_smoothing_alpha", 1.0))
+        if smoothing_alpha < 1.0:
+            logger.info(
+                "Machine A ref_chunk smoothing enabled alpha=%.3f passes=%s indices=%s",
+                smoothing_alpha,
+                getattr(env_config, "ref_chunk_smoothing_passes", 1),
+                getattr(env_config, "ref_chunk_smoothing_indices", None),
+            )
 
     def close(self) -> None:
         if isinstance(self._feature_provider, MachineAFeatureClient):
@@ -806,6 +856,7 @@ class EnvDriver:
                     self._feature_provider.get_features(plan_observation),
                     self._rl_config,
                     observation=plan_observation,
+                    env_config=self._env_config,
                 )
                 current_features = _chunk_features_from_payload(current, self._rl_config)
                 ref_chunk = current_features.ref_chunk
@@ -1182,6 +1233,7 @@ class EnvDriver:
             self._feature_provider.get_features(raw_episode.observations[key]),
             self._rl_config,
             observation=raw_episode.observations[key],
+            env_config=self._env_config,
         )
         feature_cache[key] = payload
         stats["fetched_anchor_count"] += 1
@@ -1337,7 +1389,12 @@ class EnvDriver:
                 )
             batch_time = time.time() - batch_start
             for idx, result in zip(sorted_indices, results, strict=True):
-                feature_cache[idx] = normalize_feature_payload(result, self._rl_config, observation=needed[idx])
+                feature_cache[idx] = normalize_feature_payload(
+                    result,
+                    self._rl_config,
+                    observation=needed[idx],
+                    env_config=self._env_config,
+                )
             stats["batch_prefetch_count"] = len(observations)
             stats["batch_prefetch_num_requests"] = num_requests
             stats["batch_prefetch_micro_batch_size"] = micro_batch_size
@@ -1358,6 +1415,7 @@ class EnvDriver:
                     self._feature_provider.get_features(obs),
                     self._rl_config,
                     observation=obs,
+                    env_config=self._env_config,
                 )
                 feature_cache[obs_idx] = payload
                 stats["fetched_anchor_count"] += 1

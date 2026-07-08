@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import faulthandler
 import logging
 from pathlib import Path
 import sys
@@ -34,6 +35,8 @@ for path in (SRC_ROOT, REPO_ROOT_OUTER, SCRIPT_DIR):
 
 from examples.rokae_zhixing_dual import constants as rokae_constants
 from examples.rokae_zhixing_dual import robot_utils as rokae_utils
+
+rokae_utils.preload_pyrokae(rokae_constants.ROKAE_SDK_PYTHON_DIR)
 
 from manual_signal_bridge import (
     ENTER_CRITICAL_PHASE_SERVICE,
@@ -94,7 +97,7 @@ class UMIJointActionRecorder(Node):
         [left_j1..left_j7, left_gripper, right_j1..right_j7, right_gripper]
       - split topics: each JointState.position has 8D [j1..j7, gripper].
 
-    The rollout policy/replay units for Rokae are degrees/mm. If the UMI side
+    The rollout policy/replay units for Rokae are degrees and SDK raw gripper position / 100. If the UMI side
     publishes hardware units (rad/m), pass --umi_action_units hardware_rad_m.
     The default auto mode treats small joint magnitudes plus sub-meter gripper
     values as hardware units and converts them.
@@ -219,7 +222,8 @@ class RokaeUMITeleopTriggerNode(TeleopTriggerNode):
 
 class DualRokaeRobotBridge:
     # Public RLT/replay/action units follow the converted LeRobot dataset:
-    # joints in degrees, grippers in millimeters. Hardware SDK calls stay rad/m.
+    # joints in degrees, grippers in Zhixing SDK raw position divided by
+    # ROKAE_POLICY_GRIPPER_RAW_SCALE. Hardware SDK calls stay rad/raw.
     DEFAULT_ACTION_DELTA_LIMITS: tuple[float, ...] = (
         1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 10.0,
         1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 1.72, 10.0,
@@ -240,6 +244,7 @@ class DualRokaeRobotBridge:
         self._image_recorder = image_recorder
         self._lock = threading.Lock()
         self._last_sent_hw: np.ndarray | None = None
+        self._confirm_each_action = bool(getattr(args, "confirm_each_action", False))
 
     @staticmethod
     def _joint_slices() -> tuple[slice, slice]:
@@ -257,22 +262,24 @@ class DualRokaeRobotBridge:
 
     @classmethod
     def _hardware_to_policy_units(cls, values_hw: np.ndarray) -> np.ndarray:
-        """Convert hardware units rad/m to dataset/RLT units degree/mm."""
+        """Convert mixed hardware units rad/raw_scaled to dataset/RLT units."""
         converted = np.asarray(values_hw, dtype=np.float32).copy()
         for slc in cls._joint_slices():
             converted[slc] = np.rad2deg(converted[slc])
-        for idx in cls._gripper_indices():
-            converted[idx] = converted[idx] * 1000.0
         return converted
 
     @classmethod
     def _policy_to_hardware_units(cls, values_policy: np.ndarray) -> np.ndarray:
-        """Convert dataset/RLT units degree/mm to hardware units rad/m."""
+        """Convert dataset/RLT units to mixed hardware units rad/raw_scaled."""
         converted = np.asarray(values_policy, dtype=np.float32).copy()
         for slc in cls._joint_slices():
             converted[slc] = np.deg2rad(converted[slc])
         for idx in cls._gripper_indices():
-            converted[idx] = converted[idx] * 0.001
+            converted[idx] = np.clip(
+                converted[idx],
+                rokae_constants.GRIPPER_POS_OPEN / rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE,
+                rokae_constants.GRIPPER_POS_CLOSE / rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE,
+            )
         return converted
 
     @classmethod
@@ -289,8 +296,9 @@ class DualRokaeRobotBridge:
     def _get_hardware_state(self) -> np.ndarray:
         left_q = self._arms.left.get_joint_angles_rad()
         right_q = self._arms.right.get_joint_angles_rad()
-        left_g = float(np.clip(self._left_gripper.get_position_m(), 0.0, rokae_constants.GRIPPER_OPEN_M))
-        right_g = float(np.clip(self._right_gripper.get_position_m(), 0.0, rokae_constants.GRIPPER_OPEN_M))
+        scale = float(rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE)
+        left_g = float(np.clip(self._left_gripper.get_raw_position() / scale, 0.0, rokae_constants.GRIPPER_POS_CLOSE / scale))
+        right_g = float(np.clip(self._right_gripper.get_raw_position() / scale, 0.0, rokae_constants.GRIPPER_POS_CLOSE / scale))
         return np.concatenate([left_q, [left_g], right_q, [right_g]], dtype=np.float32)
 
     def shutdown(self) -> None:
@@ -348,23 +356,50 @@ class DualRokaeRobotBridge:
         with self._lock:
             desired_hw = self._policy_to_hardware_units(action_policy)
             limited_hw = self._limit_action(desired_hw, source=_source)
+            self._wait_for_action_confirmation(limited_hw, source=_source)
             left_q = limited_hw[: rokae_constants.ARM_DOF]
             left_g = float(limited_hw[rokae_constants.ARM_DOF])
             right_base = rokae_constants.SINGLE_ARM_ACTION_DIM
             right_q = limited_hw[right_base : right_base + rokae_constants.ARM_DOF]
             right_g = float(limited_hw[right_base + rokae_constants.ARM_DOF])
             self._arms.servo_j(np.concatenate([left_q, right_q], dtype=np.float32))
-            self._left_gripper.set_opening_m(left_g)
-            self._right_gripper.set_opening_m(right_g)
+            scale = float(rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE)
+            self._left_gripper.set_raw_position(left_g * scale)
+            self._right_gripper.set_raw_position(right_g * scale)
             self._last_sent_hw = limited_hw.copy()
             return self._hardware_to_policy_units(limited_hw)
+
+    def _wait_for_action_confirmation(self, action_hw: np.ndarray, *, source: str) -> None:
+        if not self._confirm_each_action:
+            return
+        action_policy = self._hardware_to_policy_units(action_hw)
+        np.set_printoptions(precision=3, suppress=True)
+        print(
+            f"[confirm_each_action] source={source} action_deg_gripperraw_div100={action_policy.tolist()} "
+            "press Enter to execute",
+            flush=True,
+        )
+        input()
+        print(f"[confirm_each_action] source={source} confirmed; executing action", flush=True)
+
+    def wait_for_reset_confirmation(self, *, mode: str, speed: float) -> None:
+        if not self._confirm_each_action:
+            return
+        print(
+            f"[confirm_reset] task_mode={mode} reset_movej_speed={speed:.3f} "
+            "press Enter to move to reset pose",
+            flush=True,
+        )
+        input()
+        print("[confirm_reset] confirmed; executing reset move", flush=True)
 
     def _limit_action(self, desired_hw: np.ndarray, *, source: str = "policy") -> np.ndarray:
         desired = self._clip_joint_limits_hw(desired_hw)
         left_g_idx = rokae_constants.ARM_DOF
         right_g_idx = rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF
-        desired[left_g_idx] = np.clip(desired[left_g_idx], rokae_constants.GRIPPER_CLOSE_M, rokae_constants.GRIPPER_OPEN_M)
-        desired[right_g_idx] = np.clip(desired[right_g_idx], rokae_constants.GRIPPER_CLOSE_M, rokae_constants.GRIPPER_OPEN_M)
+        max_gripper = rokae_constants.GRIPPER_POS_CLOSE / rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE
+        desired[left_g_idx] = np.clip(desired[left_g_idx], 0.0, max_gripper)
+        desired[right_g_idx] = np.clip(desired[right_g_idx], 0.0, max_gripper)
         reference = self._last_sent_hw
         if reference is None:
             reference = self._get_hardware_state()
@@ -379,7 +414,7 @@ class DualRokaeRobotBridge:
             limited[slc] = reference[slc] + np.clip(desired[slc] - reference[slc], -max_dq, max_dq)
         for idx in self._gripper_indices():
             limited[idx] = np.clip(reference[idx] + np.clip(desired[idx] - reference[idx], -max_dg, max_dg),
-                                   rokae_constants.GRIPPER_CLOSE_M, rokae_constants.GRIPPER_OPEN_M)
+                                   0.0, max_gripper)
         return limited
 
     def reset_control_state(self) -> None:
@@ -396,6 +431,8 @@ class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
         return self._robot.send_action(action, _source="teleop")
 
     def _reset_robot_to_mode_start(self) -> None:
+        reset_speed = max(float(getattr(self._robot._args, "reset_movej_speed", rokae_constants.ROKAE_RESET_MOVEJ_SPEED)), 0.1)
+        self._robot.wait_for_reset_confirmation(mode=self._task_mode, speed=reset_speed)
         target_raw = (
             self._system.env_driver.critical_phase_reset_action
             if self._task_mode == "critical_phase"
@@ -412,10 +449,12 @@ class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
                     np.concatenate([left_q, right_q], dtype=np.float32),
                     wait=True,
                     timeout=60.0,
-                    restore_realtime=True,
+                    speed=reset_speed,
+                    restore_realtime=False,
                 )
-                self._robot._left_gripper.set_opening_m(float(target_hw[rokae_constants.ARM_DOF]))
-                self._robot._right_gripper.set_opening_m(float(target_hw[right_base + rokae_constants.ARM_DOF]))
+                scale = float(rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE)
+                self._robot._left_gripper.set_raw_position(float(target_hw[rokae_constants.ARM_DOF]) * scale)
+                self._robot._right_gripper.set_raw_position(float(target_hw[right_base + rokae_constants.ARM_DOF]) * scale)
             else:
                 raise ValueError(f"Dual Rokae reset action must be 16D if configured, got {target_policy.shape[0]}")
         else:
@@ -424,7 +463,8 @@ class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
                 np.asarray(rokae_constants.RIGHT_RESET_END_POSE, dtype=np.float32),
                 wait=True,
                 timeout=60.0,
-                restore_realtime=True,
+                speed=reset_speed,
+                restore_realtime=False,
             )
             self._robot._left_gripper.open()
             self._robot._right_gripper.open()
@@ -436,7 +476,7 @@ class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Dual Rokae + Zhixing RLT robot rollout")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
-    parser.add_argument("--task", type=str, default="dual arm manipulation")
+    parser.add_argument("--task", type=str, default="Pick up the paper cups and stack them up")
     parser.add_argument("--num_episodes", type=int, default=None)
     parser.add_argument("--max_chunk_steps_per_episode", type=int, default=200)
     parser.add_argument("--idle_sleep_sec", type=float, default=0.02)
@@ -477,7 +517,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy_max_delta_rad", type=float, default=rokae_constants.MAX_JOINT_DELTA_RAD)
     parser.add_argument("--policy_max_delta_gripper_m", type=float, default=rokae_constants.MAX_GRIPPER_DELTA_M)
     parser.add_argument("--teleop_max_delta_rad", type=float, default=0.05)
-    parser.add_argument("--teleop_max_delta_gripper_m", type=float, default=rokae_constants.GRIPPER_OPEN_M)
+    parser.add_argument(
+        "--teleop_max_delta_gripper_m",
+        type=float,
+        default=rokae_constants.GRIPPER_POS_CLOSE / rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE,
+    )
+    parser.add_argument(
+        "--reset_movej_speed",
+        type=float,
+        default=rokae_constants.ROKAE_RESET_MOVEJ_SPEED,
+        help="Rokae non-realtime MoveJ speed for episode reset. Default is the slowest configured reset speed.",
+    )
     parser.add_argument("--teleop_trigger_service", type=str, default=DEFAULT_TELEOP_TRIGGER_SVC)
     parser.add_argument("--policy_resume_delay_s", type=float, default=1.0)
     parser.add_argument("--start_in_human_mode", action="store_true")
@@ -489,16 +539,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--umi_action_units",
         choices=("auto", "policy_deg_mm", "hardware_rad_m"),
         default="auto",
-        help="Units published by UMI JointState.position. Rokae policy/replay units are deg/mm.",
+        help="Units published by UMI JointState.position. Rokae policy/replay units are deg + SDK raw gripper position / 100.",
     )
     parser.add_argument("--require_online_approval", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--confirm_each_action",
+        action="store_true",
+        help="Before each executed frame, print the action and wait for Enter.",
+    )
     parser.add_argument("--step_trace_stride", type=int, default=None)
     parser.add_argument("--eval_actor_only", action="store_true")
-    parser.add_argument("--ros_domain_id", type=int, default=None)
+    parser.add_argument("--ros_domain_id", type=int, default=9)
     return parser
 
 
 def main() -> None:
+    faulthandler.enable(all_threads=True)
     args = _build_arg_parser().parse_args()
     system = _override_system_urls(load_system_config_yaml(args.config), args)
     if system.rl.action_dim != rokae_constants.DUAL_ACTION_DIM:
@@ -565,13 +621,13 @@ def main() -> None:
         fps=args.realsense_fps,
     )
 
-    image_recorder.start()
     arms.connect()
     arms.enable()
     if not left_gripper.init():
         raise RuntimeError("left gripper initialization failed")
     if not right_gripper.init():
         raise RuntimeError("right gripper initialization failed")
+    image_recorder.start()
 
     robot = DualRokaeRobotBridge(args, arms, left_gripper, right_gripper, image_recorder)
     human_action_recorder = (

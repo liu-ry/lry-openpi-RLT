@@ -110,6 +110,15 @@ class EnvDriverConfig:
     control_frequency_hz: float = 50.0
     step_trace_stride: int = 0
     replay_feature_batch_size: int = 16
+    # Optional causal smoothing for Machine A/VLA ref_chunk before it is used
+    # by the actor, replay, or direct fallback execution. alpha=1 disables EMA.
+    ref_chunk_smoothing_alpha: float = 1.0
+    ref_chunk_smoothing_passes: int = 1
+    ref_chunk_smoothing_indices: list[int] | None = None
+    # Capture image observations once every N control ticks during chunk execution.
+    # N=1 preserves the original behavior. Larger values keep servo commands at
+    # control_frequency_hz while reducing camera/resize load.
+    observation_capture_interval: int = 1
     enable_human_override: bool = False
     safe_fallback_to_ref: bool = True
     machine_a_connect_timeout_sec: float = 5.0
