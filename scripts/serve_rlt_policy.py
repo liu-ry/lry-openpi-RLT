@@ -31,6 +31,7 @@ import tyro
 import openpi.models.model as _model
 from openpi.models.rl_token import RLTokenConfig
 from openpi.models.rl_token import RLTokenModel
+from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -354,6 +355,81 @@ class RLTPolicy(_base_policy.BasePolicy):
         return self._metadata
 
 
+class VLAOnlyMachineAPolicy(_base_policy.BasePolicy):
+    """Machine-A-compatible wrapper around a plain VLA policy.
+
+    The online-RL rollout client expects Machine A to return z_rl/ref_chunk.
+    For VLA-only rollout, ref_chunk comes from the VLA action output and z_rl is
+    a zero placeholder. This keeps the wire protocol unchanged while avoiding
+    any RLTokenModel checkpoint requirement.
+    """
+
+    def __init__(
+        self,
+        policy: _base_policy.BasePolicy,
+        *,
+        metadata: dict[str, Any] | None = None,
+        z_dim: int = 2048,
+        proprio_dim: int = 7,
+        chunk_len: int = 50,
+        action_dim: int = 7,
+    ) -> None:
+        self._policy = policy
+        self._metadata = metadata or {}
+        self._z_dim = int(z_dim)
+        self._proprio_dim = int(proprio_dim)
+        self._chunk_len = int(chunk_len)
+        self._action_dim = int(action_dim)
+
+    @override
+    def infer(self, obs: dict) -> dict:
+        if "batch" in obs:
+            return self._infer_batch(obs["batch"])
+        return self._infer_single(obs)
+
+    def _infer_batch(self, obs_list: list[dict]) -> dict:
+        start_time = time.monotonic()
+        results = [self._infer_single(obs) for obs in obs_list]
+        elapsed = time.monotonic() - start_time
+        batch_size = len(obs_list)
+        return {
+            "batch_results": results,
+            "batch_size": batch_size,
+            "padded_size": batch_size,
+            "total_infer_ms": elapsed * 1000,
+            "per_sample_infer_ms": (elapsed / max(batch_size, 1)) * 1000,
+        }
+
+    def _infer_single(self, obs: dict) -> dict:
+        result = self._policy.infer(obs)
+        actions = np.asarray(result["actions"], dtype=np.float32)
+        if actions.ndim != 2:
+            raise ValueError(f"VLA policy actions must be rank-2 [T, A], got {actions.shape}")
+        if actions.shape[0] < self._chunk_len or actions.shape[1] < self._action_dim:
+            raise ValueError(
+                f"VLA policy actions must be at least [{self._chunk_len}, {self._action_dim}], got {actions.shape}"
+            )
+
+        state = np.asarray(obs.get("state", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+        proprio = np.zeros(self._proprio_dim, dtype=np.float32)
+        n = min(self._proprio_dim, state.shape[0])
+        if n:
+            proprio[:n] = state[:n].astype(np.float32)
+
+        return {
+            "z_rl": np.zeros((self._z_dim,), dtype=np.float32),
+            "proprio": proprio,
+            "ref_chunk": actions[: self._chunk_len, : self._action_dim].astype(np.float32),
+            "policy_timing": result.get("policy_timing", {}),
+            "_raw_actions": actions,
+            "_vla_only": True,
+        }
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self._metadata
+
+
 def load_rlt_model(
     config: _config.TrainConfig,
     checkpoint_dir: str,
@@ -399,12 +475,106 @@ class Args:
     port: int = 8000
     default_prompt: str | None = None
     shared_prefix_inference: bool = False
+    vla_only: bool = False
+    vla_only_z_dim: int = 2048
 
 
 def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, force=True)
 
     config = _config.get_config(args.config)
+    if args.vla_only:
+        data_config = config.data.create(config.assets_dirs, config.model)
+        checkpoint_path = pathlib.Path(args.checkpoint_dir)
+        norm_stats = None
+        if data_config.asset_id is not None:
+            try:
+                norm_stats = _checkpoints.load_norm_stats(checkpoint_path / "assets", data_config.asset_id)
+            except Exception as e:
+                logging.warning(f"Could not load norm stats for startup dim inference: {e}")
+
+        output_transforms = list(data_config.model_transforms.outputs)
+        if norm_stats:
+            output_transforms.append(_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm))
+        output_transforms.extend(data_config.data_transforms.outputs)
+
+        chunk_len = int(config.model.action_horizon)
+        action_dim = _infer_robot_action_dim(
+            output_transforms,
+            model_action_horizon=chunk_len,
+            model_action_dim=int(config.model.action_dim),
+        )
+        use_tactile = bool(getattr(config.model, "use_tactile", False))
+        fake_images = _make_fake_images(use_tactile=use_tactile)
+        proprio_dim = _infer_robot_state_dim(
+            data_config.data_transforms.inputs,
+            fake_images=fake_images,
+            action_dim=action_dim,
+            model_action_dim=int(config.model.action_dim),
+        )
+        if config.rlt_num_tokens is not None:
+            rlt_config = _create_rlt_config(config)
+            z_dim = int(rlt_config.num_rl_tokens * rlt_config.embed_dim)
+        else:
+            z_dim = int(args.vla_only_z_dim)
+
+        logging.info(
+            "Loading VLA-only policy: config=%s checkpoint=%s state_dim=%s action_dim=%s chunk_len=%s z_dim=%s",
+            args.config,
+            args.checkpoint_dir,
+            proprio_dim,
+            action_dim,
+            chunk_len,
+            z_dim,
+        )
+        base_policy = _policy_config.create_trained_policy(
+            config,
+            args.checkpoint_dir,
+            default_prompt=args.default_prompt,
+        )
+        policy = VLAOnlyMachineAPolicy(
+            base_policy,
+            metadata={
+                **(base_policy.metadata or {}),
+                "has_rl_token": False,
+                "vla_only": True,
+                "z_dim": z_dim,
+                "proprio_dim": proprio_dim,
+                "chunk_len": chunk_len,
+                "action_dim": action_dim,
+                "supports_batch": True,
+                "shared_prefix_inference": False,
+                "use_tactile": use_tactile,
+            },
+            z_dim=z_dim,
+            proprio_dim=proprio_dim,
+            chunk_len=chunk_len,
+            action_dim=action_dim,
+        )
+
+        fake_dict = {
+            "images": fake_images,
+            "state": np.zeros(proprio_dim, dtype=np.float32),
+            "prompt": "test prompt",
+        }
+        try:
+            result = policy.infer(fake_dict)
+            logging.info(f"VLA-only inference OK: z_rl={result['z_rl'].shape}, ref_chunk={result['ref_chunk'].shape}")
+        except Exception as e:
+            logging.warning(f"VLA-only inference test failed: {e}")
+
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        logging.info(f"Creating VLA-only Machine A server (host: {hostname}, ip: {local_ip}, port: {args.port})")
+        server = websocket_policy_server.WebsocketPolicyServer(
+            policy=policy,
+            host="0.0.0.0",
+            port=args.port,
+            metadata=policy.metadata,
+        )
+        server.serve_forever()
+        return
+
     if config.rlt_num_tokens is None:
         raise ValueError("Config must have RLT fields set.")
 
