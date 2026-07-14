@@ -1826,6 +1826,194 @@ _CONFIGS = [
         rlt_embed_dim=2048,
         rlt_input_dim=2048,
     ),
+    # 7.rokae 双臂叠纸杯_100组_5个杯子
+    TrainConfig(
+        name="pi05_rokae_dual_lora_finetune_stack_paper_cups_100episodes_0708",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotRokaeDualDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_five_cups_0708",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_five_cups_0708/assets",
+            ),
+            default_prompt="Pick up the paper cups and stack them up",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+        num_train_steps=60_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        keep_period=5000,
+        wandb_enabled=True,
+        num_workers=4,
+    ),
+    #
+    # RLT (Representation Learning Token) configs.
+    #
+    TrainConfig(
+        name="rlt_pi05_rokae_dual_lora_stack_paper_cups_100episodes_0708",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotRokaeDualDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_five_cups_0708",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_five_cups_0708/assets",
+            ),
+            default_prompt="Pick up the paper cups and stack them up",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/liury/src/lry-openpi-RLT/checkpoints/pi05_rokae_dual_lora_finetune_stack_paper_cups_0704/pi05_rokae_dual_lora_finetune_stack_paper_cups_0704_1/30000/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=8,
+        keep_period=2000,
+        wandb_enabled=True,
+        # Stage1：VLA 完全冻结，只训练 rlt_module
+        rlt_alpha=0.0,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+    ),
+    # 8.rokae 双臂叠纸杯_200组_5个杯子
+    TrainConfig(
+        name="pi05_rokae_dual_lora_finetune_stack_paper_cups_200episodes_0711",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotRokaeDualDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_cups_5_200_0711",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_cups_5_200_0711/assets",
+            ),
+            default_prompt="Pick up the paper cups and stack them up",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/OpenPi_checkpoints/pi05_base/params"),
+        num_train_steps=60_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        keep_period=5000,
+        wandb_enabled=True,
+        num_workers=2,
+    ),
+    #
+    # RLT (Representation Learning Token) configs.
+    #
+    TrainConfig(
+        name="rlt_pi05_rokae_dual_lora_stack_paper_cups_200episodes_0711",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_tactile=False,
+        ),
+        data=LeRobotRokaeDualDataConfig(
+            repo_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_five_cups_0708",
+            assets=AssetsConfig(
+                asset_id="/data/vt_umi_dataset/converted_dataset/rokae_stack_paper_five_cups_0708/assets",
+            ),
+            default_prompt="Pick up the paper cups and stack them up",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state":   "observation.state",
+                            "actions": "actions",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        # ← 训练完 LoRA 后，把 STEP 替换为实际 checkpoint 步数
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/liury/src/lry-openpi-RLT/checkpoints/pi05_rokae_dual_lora_finetune_stack_paper_cups_0704/pi05_rokae_dual_lora_finetune_stack_paper_cups_0704_1/30000/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=8,
+        keep_period=2000,
+        wandb_enabled=True,
+        # Stage1：VLA 完全冻结，只训练 rlt_module
+        rlt_alpha=0.0,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+    ),
     ##############  VT config ##############
     
     
