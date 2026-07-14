@@ -107,6 +107,9 @@ runtime:
 
     actor_deterministic: false # 评估时使用确定性动作 true（均值），训练时使用随机动作 false （均值+固定方差噪声）
     chunk_exec_horizon: 30
+    # Wait briefly before the next Machine A/VLA request so non-blocking servo
+    # feedback has time to catch up to the last command of the previous chunk.
+    chunk_boundary_observation_delay_sec: 0.10
 
     # 越疆 Dobot 推荐控制频率：20 Hz
     control_frequency_hz: 30.0

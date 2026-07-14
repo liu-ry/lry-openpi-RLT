@@ -119,6 +119,20 @@ class EnvDriverConfig:
     # N=1 preserves the original behavior. Larger values keep servo commands at
     # control_frequency_hz while reducing camera/resize load.
     observation_capture_interval: int = 1
+    # Optional wait before taking the observation used for the next Machine A
+    # request. This helps non-blocking servo / ROS feedback paths catch up at
+    # chunk boundaries.
+    chunk_boundary_observation_delay_sec: float = 0.0
+    # If >0, keep polling the boundary observation until its state is close to
+    # the last action target before requesting Machine A.
+    chunk_boundary_settle_tolerance: float = 0.0
+    chunk_boundary_settle_timeout_sec: float = 0.0
+    chunk_boundary_settle_poll_sec: float = 0.02
+    # If >0, after Machine A returns a chunk, replace the first N absolute
+    # action targets with a short linear ramp from the latest robot state back
+    # to the returned chunk. This removes visible backtracking caused by
+    # inference/servo latency at chunk boundaries.
+    chunk_start_reanchor_steps: int = 0
     enable_human_override: bool = False
     safe_fallback_to_ref: bool = True
     machine_a_connect_timeout_sec: float = 5.0

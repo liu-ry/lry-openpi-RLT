@@ -98,12 +98,22 @@ runtime:
     critical_phase_reset_action: [-86.965, -30.498, 106.409, 99.709, 44.431, 30.097, -12.905, 26.06, 82.634, -33.864, -107.351, 99.859, -47.919, 26.951, 4.574, 20.58]
 
     actor_deterministic: false
+    # Execute only the high-confidence prefix of the VLA 50-step chunk, then
+    # re-observe and replan. The tail of the predicted horizon tends to flatten,
+    # which makes full 50-step open-loop execution look fast-then-slow.
     chunk_exec_horizon: 30
+    # Wait briefly before the next Machine A/VLA request so non-blocking servo
+    # feedback has time to catch up to the last command of the previous chunk.
+    chunk_boundary_observation_delay_sec: 0.10
+    chunk_boundary_settle_tolerance: 0.50
+    chunk_boundary_settle_timeout_sec: 1.20
+    chunk_boundary_settle_poll_sec: 0.03
+    chunk_start_reanchor_steps: 5
     control_frequency_hz: 30.0
 
     # Smooth Machine A / VLA ref_chunk before direct execution and before the
     # local RLT actor consumes it. Only arm joints are smoothed; grippers stay raw.
-    ref_chunk_smoothing_alpha: 0.8
+    ref_chunk_smoothing_alpha: 1.0
     ref_chunk_smoothing_passes: 1
     ref_chunk_smoothing_indices: [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
     observation_capture_interval: 10

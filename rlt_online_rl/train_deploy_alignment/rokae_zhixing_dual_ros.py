@@ -220,6 +220,43 @@ class RokaeUMITeleopTriggerNode(TeleopTriggerNode):
         return response
 
 
+def _resolve_reset_policy_target(
+    robot: "DualRokaeRobotBridge",
+    system: Any,
+    task_mode: str,
+) -> np.ndarray:
+    target_raw = (
+        system.env_driver.critical_phase_reset_action
+        if task_mode == "critical_phase"
+        else system.env_driver.full_task_reset_action
+    )
+    if target_raw is not None:
+        target_policy = np.asarray(target_raw, dtype=np.float32).reshape(-1)
+        if target_policy.shape[0] != rokae_constants.DUAL_ACTION_DIM:
+            raise ValueError(f"Dual Rokae reset action must be 16D if configured, got {target_policy.shape[0]}")
+        target_hw = robot._clip_joint_limits_hw(robot._policy_to_hardware_units(target_policy))
+        return robot._hardware_to_policy_units(target_hw)
+
+    scale = float(rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE)
+    left_q = robot._arms.left.inverse_kinematics(
+        np.asarray(rokae_constants.LEFT_RESET_END_POSE, dtype=np.float32)
+    )
+    right_q = robot._arms.right.inverse_kinematics(
+        np.asarray(rokae_constants.RIGHT_RESET_END_POSE, dtype=np.float32)
+    )
+    target_hw = np.concatenate(
+        [
+            left_q,
+            [rokae_constants.GRIPPER_POS_OPEN / scale],
+            right_q,
+            [rokae_constants.GRIPPER_POS_OPEN / scale],
+        ],
+        dtype=np.float32,
+    )
+    target_hw = robot._clip_joint_limits_hw(target_hw)
+    return robot._hardware_to_policy_units(target_hw)
+
+
 class DualRokaeRobotBridge:
     # Public RLT/replay/action units follow the converted LeRobot dataset:
     # joints in degrees, grippers in Zhixing SDK raw position divided by
@@ -244,6 +281,12 @@ class DualRokaeRobotBridge:
         self._image_recorder = image_recorder
         self._lock = threading.Lock()
         self._last_sent_hw: np.ndarray | None = None
+        self._servo_lock = threading.Lock()
+        self._servo_target_q: np.ndarray | None = None
+        self._servo_running = False
+        self._servo_thread: threading.Thread | None = None
+        self._last_gripper_command_raw: np.ndarray | None = None
+        self._last_gripper_command_time = 0.0
         self._confirm_each_action = bool(getattr(args, "confirm_each_action", False))
 
     @staticmethod
@@ -301,7 +344,83 @@ class DualRokaeRobotBridge:
         right_g = float(np.clip(self._right_gripper.get_raw_position() / scale, 0.0, rokae_constants.GRIPPER_POS_CLOSE / scale))
         return np.concatenate([left_q, [left_g], right_q, [right_g]], dtype=np.float32)
 
+    def start_servo_stream(self) -> None:
+        with self._servo_lock:
+            if self._servo_running:
+                return
+            left_q = self._arms.left.get_joint_angles_rad()
+            right_q = self._arms.right.get_joint_angles_rad()
+            self._servo_target_q = np.concatenate([left_q, right_q], dtype=np.float32)
+            self._servo_running = True
+            self._servo_thread = threading.Thread(
+                target=self._servo_stream_loop,
+                name="rokae_servo_stream",
+                daemon=True,
+            )
+            self._servo_thread.start()
+        logger.info(
+            "Started Rokae realtime ServoJ hold stream at %.1f Hz max_delta_rad=%.4f",
+            float(getattr(self._args, "servo_stream_hz", getattr(self._args, "reset_servo_hz", 30.0))),
+            float(getattr(self._args, "servo_stream_max_delta_rad", 0.0)),
+        )
+
+    def stop_servo_stream(self) -> None:
+        with self._servo_lock:
+            self._servo_running = False
+            thread = self._servo_thread
+            self._servo_thread = None
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def _set_servo_target_hw(self, action_hw: np.ndarray) -> None:
+        right_base = rokae_constants.SINGLE_ARM_ACTION_DIM
+        target_q = np.concatenate(
+            [
+                action_hw[: rokae_constants.ARM_DOF],
+                action_hw[right_base : right_base + rokae_constants.ARM_DOF],
+            ],
+            dtype=np.float32,
+        )
+        with self._servo_lock:
+            self._servo_target_q = target_q
+
+    def _servo_stream_loop(self) -> None:
+        period = 1.0 / max(float(getattr(self._args, "servo_stream_hz", getattr(self._args, "reset_servo_hz", 30.0))), 1.0)
+        max_delta = max(float(getattr(self._args, "servo_stream_max_delta_rad", 0.0)), 0.0)
+        next_tick = time.monotonic()
+        last_error_log = 0.0
+        current_q: np.ndarray | None = None
+        while True:
+            with self._servo_lock:
+                running = self._servo_running
+                target_q = None if self._servo_target_q is None else self._servo_target_q.copy()
+            if not running:
+                return
+            if target_q is not None:
+                if current_q is None or current_q.shape != target_q.shape:
+                    current_q = target_q.copy()
+                elif max_delta > 0.0:
+                    current_q = current_q + np.clip(target_q - current_q, -max_delta, max_delta)
+                else:
+                    current_q = target_q.copy()
+                try:
+                    self._arms.servo_j(current_q)
+                except Exception as exc:
+                    if not self._servo_running:
+                        return
+                    now = time.monotonic()
+                    if now - last_error_log >= 1.0:
+                        logger.exception("Rokae realtime ServoJ hold stream failed: %s", exc)
+                        last_error_log = now
+            next_tick += period
+            sleep_s = next_tick - time.monotonic()
+            if sleep_s < -period:
+                next_tick = time.monotonic()
+                sleep_s = 0.0
+            time.sleep(max(0.0, sleep_s))
+
     def shutdown(self) -> None:
+        self.stop_servo_stream()
         try:
             self._arms.stop()
         except Exception:
@@ -351,26 +470,37 @@ class DualRokaeRobotBridge:
             raise ValueError(f"Expected 16D dual Rokae action, got {action_policy.shape}")
         action_policy = action_policy[: rokae_constants.DUAL_ACTION_DIM]
         if not np.all(np.isfinite(action_policy)):
-            self._arms.stop()
             raise ValueError("Action contains NaN or Inf")
         with self._lock:
             desired_hw = self._policy_to_hardware_units(action_policy)
             limited_hw = self._limit_action(desired_hw, source=_source)
             self._wait_for_action_confirmation(limited_hw, source=_source)
-            left_q = limited_hw[: rokae_constants.ARM_DOF]
             left_g = float(limited_hw[rokae_constants.ARM_DOF])
             right_base = rokae_constants.SINGLE_ARM_ACTION_DIM
-            right_q = limited_hw[right_base : right_base + rokae_constants.ARM_DOF]
             right_g = float(limited_hw[right_base + rokae_constants.ARM_DOF])
-            self._arms.servo_j(np.concatenate([left_q, right_q], dtype=np.float32))
-            scale = float(rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE)
-            self._left_gripper.set_raw_position(left_g * scale)
-            self._right_gripper.set_raw_position(right_g * scale)
+            self._set_servo_target_hw(limited_hw)
+            self._send_gripper_targets(left_g, right_g, source=_source)
             self._last_sent_hw = limited_hw.copy()
             return self._hardware_to_policy_units(limited_hw)
 
+    def _send_gripper_targets(self, left_g: float, right_g: float, *, source: str) -> None:
+        scale = float(rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE)
+        targets_raw = np.asarray([left_g * scale, right_g * scale], dtype=np.float32)
+        now = time.monotonic()
+        min_interval = 0.0 if source == "reset" else float(getattr(self._args, "gripper_command_interval_s", 0.1))
+        deadband = 0.0 if source == "reset" else float(getattr(self._args, "gripper_command_deadband_raw", 20.0))
+        if self._last_gripper_command_raw is not None:
+            elapsed = now - self._last_gripper_command_time
+            changed = float(np.max(np.abs(targets_raw - self._last_gripper_command_raw))) >= deadband
+            if elapsed < min_interval or not changed:
+                return
+        self._left_gripper.set_raw_position(float(targets_raw[0]))
+        self._right_gripper.set_raw_position(float(targets_raw[1]))
+        self._last_gripper_command_raw = targets_raw
+        self._last_gripper_command_time = now
+
     def _wait_for_action_confirmation(self, action_hw: np.ndarray, *, source: str) -> None:
-        if not self._confirm_each_action:
+        if not self._confirm_each_action or source == "reset":
             return
         action_policy = self._hardware_to_policy_units(action_hw)
         np.set_printoptions(precision=3, suppress=True)
@@ -403,7 +533,10 @@ class DualRokaeRobotBridge:
         reference = self._last_sent_hw
         if reference is None:
             reference = self._get_hardware_state()
-        if source == "teleop":
+        if source == "reset":
+            max_dq = float(getattr(self._args, "reset_servo_max_delta_rad", self._args.policy_max_delta_rad))
+            max_dg = float(getattr(self._args, "reset_servo_max_delta_gripper_m", self._args.policy_max_delta_gripper_m))
+        elif source == "teleop":
             max_dq = float(getattr(self._args, "teleop_max_delta_rad", self._args.policy_max_delta_rad))
             max_dg = float(getattr(self._args, "teleop_max_delta_gripper_m", self._args.policy_max_delta_gripper_m))
         else:
@@ -420,9 +553,117 @@ class DualRokaeRobotBridge:
     def reset_control_state(self) -> None:
         with self._lock:
             self._last_sent_hw = None
+            self._last_gripper_command_raw = None
+            self._last_gripper_command_time = 0.0
 
     def reset_teleop_state(self) -> None:
         self.reset_control_state()
+
+    def reset_to_policy_target(
+        self,
+        target_policy: np.ndarray,
+        *,
+        task_mode: str,
+        resize_hw: tuple[int, int],
+        task: str,
+    ) -> None:
+        observation = self.get_observation(resize_hw, task)
+        start = np.asarray(observation["state"], dtype=np.float32).reshape(-1)[: rokae_constants.DUAL_ACTION_DIM]
+        target = np.asarray(target_policy, dtype=np.float32).reshape(-1)[: rokae_constants.DUAL_ACTION_DIM]
+        if start.shape[0] != rokae_constants.DUAL_ACTION_DIM or target.shape[0] != rokae_constants.DUAL_ACTION_DIM:
+            raise RuntimeError(f"Dual Rokae reset expects 16D state/target, got {start.shape=} {target.shape=}")
+
+        self.reset_control_state()
+        control_hz = max(float(getattr(self._args, "reset_servo_hz", 0.0)), 1.0)
+        reset_duration_s = max(float(getattr(self._args, "reset_servo_duration_s", 4.0)), 0.5)
+        reset_timeout_s = reset_duration_s + 3.0
+        reset_steps = max(int(reset_duration_s * control_hz), 1)
+        reset_sleep_s = 1.0 / control_hz
+        joint_indices = list(range(rokae_constants.ARM_DOF)) + list(
+            range(
+                rokae_constants.SINGLE_ARM_ACTION_DIM,
+                rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF,
+            )
+        )
+        gripper_indices = [
+            rokae_constants.ARM_DOF,
+            rokae_constants.SINGLE_ARM_ACTION_DIM + rokae_constants.ARM_DOF,
+        ]
+        joint_tol_deg = 1.0
+        gripper_tol = 1.0
+
+        def reset_error(state: np.ndarray) -> tuple[float, float]:
+            current = np.asarray(state, dtype=np.float32).reshape(-1)[: rokae_constants.DUAL_ACTION_DIM]
+            joint_err = float(np.max(np.abs(current[joint_indices] - target[joint_indices])))
+            gripper_err = float(np.max(np.abs(current[gripper_indices] - target[gripper_indices])))
+            return joint_err, gripper_err
+
+        def reset_reached(state: np.ndarray) -> tuple[bool, float, float]:
+            joint_err, gripper_err = reset_error(state)
+            return joint_err <= joint_tol_deg and gripper_err <= gripper_tol, joint_err, gripper_err
+
+        reached, joint_err, gripper_err = reset_reached(start)
+        if reached:
+            self.send_action(target, _source="reset")
+            logger.info(
+                "Dual Rokae reset already reached task_mode=%s joint_err_deg=%.3f gripper_err=%.3f",
+                task_mode,
+                joint_err,
+                gripper_err,
+            )
+            return
+
+        logger.info(
+            "Resetting dual Rokae with realtime ServoJ task_mode=%s duration=%.2fs steps=%s",
+            task_mode,
+            reset_duration_s,
+            reset_steps,
+        )
+        deadline = time.time() + reset_timeout_s
+        start_time = time.monotonic()
+        for step in range(1, reset_steps + 1):
+            if not rclpy.ok() or time.time() >= deadline:
+                break
+            tau = float(step) / float(reset_steps)
+            alpha = tau * tau * tau * (10.0 + tau * (-15.0 + 6.0 * tau))
+            waypoint = start + alpha * (target - start)
+            self.send_action(waypoint, _source="reset")
+            next_tick = start_time + step * reset_sleep_s
+            time.sleep(max(0.0, next_tick - time.monotonic()))
+
+        settle_steps = max(int(0.5 * control_hz), 1)
+        for step in range(settle_steps):
+            if not rclpy.ok() or time.time() >= deadline:
+                break
+            self.send_action(target, _source="reset")
+            next_tick = start_time + (reset_steps + step + 1) * reset_sleep_s
+            time.sleep(max(0.0, next_tick - time.monotonic()))
+
+        observation = self.get_observation(resize_hw, task)
+        state = np.asarray(observation["state"], dtype=np.float32).reshape(-1)
+        reached, joint_err, gripper_err = reset_reached(state)
+
+        while not reached and rclpy.ok() and time.time() < deadline:
+            self.send_action(target, _source="reset")
+            time.sleep(reset_sleep_s)
+            observation = self.get_observation(resize_hw, task)
+            state = np.asarray(observation["state"], dtype=np.float32).reshape(-1)
+            reached, joint_err, gripper_err = reset_reached(state)
+
+        if reached:
+            logger.info(
+                "Dual Rokae reset reached target task_mode=%s joint_err_deg=%.3f gripper_err=%.3f",
+                task_mode,
+                joint_err,
+                gripper_err,
+            )
+        else:
+            logger.warning(
+                "Dual Rokae reset target not reached within timeout task_mode=%s joint_err_deg=%.3f gripper_err=%.3f",
+                task_mode,
+                joint_err,
+                gripper_err,
+            )
 
 
 class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
@@ -430,47 +671,29 @@ class DualRokaeEnvAdapter(PikaChunkEnvAdapter):
         action = super()._sample_latest_human_action(observation)
         return self._robot.send_action(action, _source="teleop")
 
+    def prepare_startup_reset(self) -> None:
+        logger.info("Performing startup reset before waiting for the first rollout request.")
+        self._intervention_state.enter_episode_reset()
+        self._runtime_context.reset_episode_state()
+        self._robot.wait_for_observation_ready(timeout_s=self._obs_ready_timeout_s)
+        self._reset_robot_to_mode_start()
+        self._last_sent_action = None
+        self._reset_done_for_next_episode = True
+
     def _reset_robot_to_mode_start(self) -> None:
-        reset_speed = max(float(getattr(self._robot._args, "reset_movej_speed", rokae_constants.ROKAE_RESET_MOVEJ_SPEED)), 0.1)
-        self._robot.wait_for_reset_confirmation(mode=self._task_mode, speed=reset_speed)
-        target_raw = (
-            self._system.env_driver.critical_phase_reset_action
-            if self._task_mode == "critical_phase"
-            else self._system.env_driver.full_task_reset_action
-        )
-        if target_raw is not None:
-            target_policy = np.asarray(target_raw, dtype=np.float32).reshape(-1)
-            if target_policy.shape[0] == rokae_constants.DUAL_ACTION_DIM:
-                target_hw = self._robot._clip_joint_limits_hw(self._robot._policy_to_hardware_units(target_policy))
-                left_q = target_hw[: rokae_constants.ARM_DOF]
-                right_base = rokae_constants.SINGLE_ARM_ACTION_DIM
-                right_q = target_hw[right_base : right_base + rokae_constants.ARM_DOF]
-                self._robot._arms.move_j(
-                    np.concatenate([left_q, right_q], dtype=np.float32),
-                    wait=True,
-                    timeout=60.0,
-                    speed=reset_speed,
-                    restore_realtime=False,
-                )
-                scale = float(rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE)
-                self._robot._left_gripper.set_raw_position(float(target_hw[rokae_constants.ARM_DOF]) * scale)
-                self._robot._right_gripper.set_raw_position(float(target_hw[right_base + rokae_constants.ARM_DOF]) * scale)
-            else:
-                raise ValueError(f"Dual Rokae reset action must be 16D if configured, got {target_policy.shape[0]}")
-        else:
-            self._robot._arms.move_j_pose(
-                np.asarray(rokae_constants.LEFT_RESET_END_POSE, dtype=np.float32),
-                np.asarray(rokae_constants.RIGHT_RESET_END_POSE, dtype=np.float32),
-                wait=True,
-                timeout=60.0,
-                speed=reset_speed,
-                restore_realtime=False,
-            )
-            self._robot._left_gripper.open()
-            self._robot._right_gripper.open()
+        target_policy = _resolve_reset_policy_target(self._robot, self._system, self._task_mode)
+        self._reset_robot_with_realtime_servo(target_policy)
         self._robot.reset_control_state()
         self._last_sent_action = None
         time.sleep(0.3)
+
+    def _reset_robot_with_realtime_servo(self, target_policy: np.ndarray) -> None:
+        self._robot.reset_to_policy_target(
+            target_policy,
+            task_mode=self._task_mode,
+            resize_hw=self._resize_hw,
+            task=self._task_state.get(),
+        )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -526,7 +749,55 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--reset_movej_speed",
         type=float,
         default=rokae_constants.ROKAE_RESET_MOVEJ_SPEED,
-        help="Rokae non-realtime MoveJ speed for episode reset. Default is the slowest configured reset speed.",
+        help="Legacy non-realtime MoveJ reset speed; current rollout reset uses realtime ServoJ.",
+    )
+    parser.add_argument(
+        "--reset_servo_duration_s",
+        type=float,
+        default=6.0,
+        help="Duration for realtime ServoJ reset trajectory between episodes.",
+    )
+    parser.add_argument(
+        "--reset_servo_hz",
+        type=float,
+        default=30.0,
+        help="Command frequency for realtime ServoJ reset trajectory.",
+    )
+    parser.add_argument(
+        "--servo_stream_hz",
+        type=float,
+        default=60.0,
+        help="Background ServoJ hold-stream frequency. Keeps arms enabled during policy/replay blocking work.",
+    )
+    parser.add_argument(
+        "--servo_stream_max_delta_rad",
+        type=float,
+        default=0.015,
+        help="Per-stream-tick joint delta limit for smoothing policy ServoJ targets. 0 disables stream-side smoothing.",
+    )
+    parser.add_argument(
+        "--reset_servo_max_delta_rad",
+        type=float,
+        default=0.015,
+        help="Per-command joint delta limit for realtime ServoJ reset.",
+    )
+    parser.add_argument(
+        "--reset_servo_max_delta_gripper_m",
+        type=float,
+        default=rokae_constants.GRIPPER_POS_CLOSE / rokae_constants.ROKAE_POLICY_GRIPPER_RAW_SCALE,
+        help="Per-command gripper delta limit for realtime ServoJ reset in policy gripper units.",
+    )
+    parser.add_argument(
+        "--gripper_command_interval_s",
+        type=float,
+        default=0.1,
+        help="Minimum interval between non-reset Zhixing gripper Modbus commands.",
+    )
+    parser.add_argument(
+        "--gripper_command_deadband_raw",
+        type=float,
+        default=20.0,
+        help="Skip non-reset gripper command if both raw targets changed less than this amount.",
     )
     parser.add_argument("--teleop_trigger_service", type=str, default=DEFAULT_TELEOP_TRIGGER_SVC)
     parser.add_argument("--policy_resume_delay_s", type=float, default=1.0)
@@ -630,6 +901,17 @@ def main() -> None:
     image_recorder.start()
 
     robot = DualRokaeRobotBridge(args, arms, left_gripper, right_gripper, image_recorder)
+    robot.start_servo_stream()
+    logger.info("Performing startup reset immediately after enable, before ROS/MachineA rollout setup.")
+    robot.wait_for_observation_ready(timeout_s=args.obs_ready_timeout_s)
+    startup_target_policy = _resolve_reset_policy_target(robot, system, system.env_driver.task_mode)
+    robot.reset_to_policy_target(
+        startup_target_policy,
+        task_mode=system.env_driver.task_mode,
+        resize_hw=(args.image_h, args.image_w),
+        task=task_state.get(),
+    )
+    robot.reset_control_state()
     human_action_recorder = (
         NullHumanActionRecorder()
         if args.disable_human_override
@@ -719,6 +1001,7 @@ def main() -> None:
         resize_hw=(args.image_h, args.image_w),
         obs_ready_timeout_s=args.obs_ready_timeout_s,
     )
+    env._reset_done_for_next_episode = True
     driver = EnvDriver(
         env=env,
         feature_provider=feature_provider,

@@ -27,6 +27,7 @@ Input episode layout:
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -51,6 +52,7 @@ VIDEO_FILES = {
     "observation.images.cam_left_wrist": "realsense_rgb_wrist_left.mp4",
     "observation.images.cam_right_wrist": "realsense_rgb_wrist_right.mp4",
 }
+DEFAULT_MAX_LENGTH_DELTA = 3
 
 
 def find_existing_file(base_dir: Path, candidates: list[str]) -> Path:
@@ -104,6 +106,30 @@ def get_video_frame_count(video_path: Path) -> int:
     return count
 
 
+def check_lengths_and_get_target(
+    lengths: dict[str, int],
+    *,
+    max_length_delta: int,
+    context: str,
+) -> tuple[int, bool]:
+    min_length = min(lengths.values())
+    max_length = max(lengths.values())
+    needs_trim = min_length != max_length
+    if max_length - min_length > max_length_delta:
+        raise ValueError(f"{context}长度不一致且超过 {max_length_delta} 帧: {lengths}")
+    if min_length < 2:
+        raise ValueError(f"{context}有效长度过短: {lengths}")
+    return min_length, needs_trim
+
+
+def trim_array(array: np.ndarray, length: int) -> np.ndarray:
+    return array[:length]
+
+
+def trim_frames(frames: list[np.ndarray], length: int) -> list[np.ndarray]:
+    return frames[:length]
+
+
 def get_action_from_state_pos(state_pos: np.ndarray) -> np.ndarray:
     if len(state_pos) < 2:
         raise ValueError("episode 至少需要 2 帧才能构造下一帧动作")
@@ -127,6 +153,7 @@ def load_state(
     *,
     joints_in_degrees: bool,
     gripper_scale: float,
+    max_length_delta: int = DEFAULT_MAX_LENGTH_DELTA,
 ) -> tuple[np.ndarray, np.ndarray]:
     left_joint = np.load(episode_dir / "robot_rokae_dual_left_joint.npy").astype(np.float32)
     right_joint = np.load(episode_dir / "robot_rokae_dual_right_joint.npy").astype(np.float32)
@@ -143,21 +170,124 @@ def load_state(
         "left_gripper": len(left_gripper),
         "right_gripper": len(right_gripper),
     }
-    if len(set(raw_lengths.values())) > 1:
-        raise ValueError(f"state 源数据长度不一致: {raw_lengths}")
+    target_length, needs_trim = check_lengths_and_get_target(
+        raw_lengths,
+        max_length_delta=max_length_delta,
+        context="state 源数据",
+    )
+    if needs_trim:
+        print(f"  警告: state 源数据长度不一致 {raw_lengths}，裁剪到 {target_length} 帧")
 
-    left_joint = left_joint[:, :ARM_DOF]
-    right_joint = right_joint[:, :ARM_DOF]
+    left_joint = left_joint[:target_length, :ARM_DOF]
+    right_joint = right_joint[:target_length, :ARM_DOF]
     if joints_in_degrees:
         left_joint = np.deg2rad(left_joint)
         right_joint = np.deg2rad(right_joint)
 
-    left_gripper = (left_gripper * gripper_scale).reshape(-1, 1)
-    right_gripper = (right_gripper * gripper_scale).reshape(-1, 1)
+    left_gripper = (left_gripper[:target_length] * gripper_scale).reshape(-1, 1)
+    right_gripper = (right_gripper[:target_length] * gripper_scale).reshape(-1, 1)
 
     state = np.concatenate([left_joint, left_gripper, right_joint, right_gripper], axis=1).astype(np.float32)
     actions = get_action_from_state_pos(state)
     return state, actions
+
+
+def get_episode_task(metadata: dict[str, Any], fallback_task: str) -> str:
+    return metadata.get("prompt") or metadata.get("task") or metadata.get("recipe_name") or fallback_task
+
+
+def collect_episode_lengths(
+    episode_dir: Path,
+    *,
+    state_length: int | None = None,
+) -> dict[str, int]:
+    lengths: dict[str, int] = {}
+    if state_length is not None:
+        lengths["state"] = state_length
+    lengths["timestamps"] = len(np.load(episode_dir / "timestamps.npy"))
+    for key, filename in VIDEO_FILES.items():
+        lengths[key] = get_video_frame_count(episode_dir / filename)
+    return lengths
+
+
+def convert_episode(
+    episode_dir: Path,
+    *,
+    dataset: LeRobotDataset | None,
+    task: str,
+    dry_run: bool,
+    joints_in_degrees: bool,
+    gripper_scale: float,
+    max_length_delta: int = DEFAULT_MAX_LENGTH_DELTA,
+) -> int:
+    metadata = load_metadata(episode_dir)
+    episode_task = get_episode_task(metadata, task)
+    state_pos, actions = load_state(
+        episode_dir,
+        joints_in_degrees=joints_in_degrees,
+        gripper_scale=gripper_scale,
+        max_length_delta=max_length_delta,
+    )
+    timestamps = np.load(episode_dir / "timestamps.npy")
+
+    lengths = collect_episode_lengths(episode_dir, state_length=len(state_pos))
+    target_length, needs_trim = check_lengths_and_get_target(
+        lengths,
+        max_length_delta=max_length_delta,
+        context="episode 数据",
+    )
+    if needs_trim:
+        print(f"  警告: episode 数据长度不一致 {lengths}，裁剪到 {target_length} 帧")
+
+    state_pos = trim_array(state_pos, target_length)
+    actions = trim_array(actions, target_length)
+    timestamps = trim_array(timestamps, target_length)
+
+    if dry_run:
+        print(
+            f"  OK: steps={target_length}, state_shape={state_pos.shape}, "
+            f"lengths={lengths}, task={episode_task!r}"
+        )
+        return target_length
+
+    if dataset is None:
+        raise ValueError("dataset 不能为空，除非 dry_run=True")
+
+    video_frames = {
+        key: extract_video_to_frames(episode_dir / filename)
+        for key, filename in VIDEO_FILES.items()
+    }
+    decoded_lengths = {
+        "state": len(state_pos),
+        "actions": len(actions),
+        "timestamps": len(timestamps),
+        **{key: len(frames) for key, frames in video_frames.items()},
+    }
+    decoded_target_length, decoded_needs_trim = check_lengths_and_get_target(
+        decoded_lengths,
+        max_length_delta=max_length_delta,
+        context="解码后 episode 数据",
+    )
+    if decoded_needs_trim:
+        print(f"  警告: 解码后数据长度不一致 {decoded_lengths}，裁剪到 {decoded_target_length} 帧")
+        state_pos = trim_array(state_pos, decoded_target_length)
+        actions = trim_array(actions, decoded_target_length)
+        timestamps = trim_array(timestamps, decoded_target_length)
+        video_frames = {key: trim_frames(frames, decoded_target_length) for key, frames in video_frames.items()}
+        target_length = decoded_target_length
+
+    for step_idx in range(target_length):
+        frame_data = {
+            "observation.images.cam_high": video_frames["observation.images.cam_high"][step_idx],
+            "observation.images.cam_left_wrist": video_frames["observation.images.cam_left_wrist"][step_idx],
+            "observation.images.cam_right_wrist": video_frames["observation.images.cam_right_wrist"][step_idx],
+            "observation.state": state_pos[step_idx],
+            "actions": actions[step_idx],
+            "task": episode_task,
+        }
+        dataset.add_frame(frame_data)
+    dataset.save_episode()
+    return target_length
 
 
 def create_dataset(output_dir: str, fps: int) -> LeRobotDataset:
@@ -218,6 +348,7 @@ def main(
     dry_run: bool = False,
     joints_in_degrees: bool = False,
     gripper_scale: float = 1.0,
+    max_length_delta: int = DEFAULT_MAX_LENGTH_DELTA,
 ) -> None:
     """Convert /home/lry/RokaeDual style episodes to LeRobot.
 
@@ -231,6 +362,7 @@ def main(
         dry_run: Validate files, shapes, and lengths without writing output.
         joints_in_degrees: Convert joint arrays from degrees to radians when enabled.
         gripper_scale: Scale gripper width values. Default keeps raw values unchanged.
+        max_length_delta: Accept length mismatches up to this many frames and trim all modalities to the shortest length.
     """
     root_path = Path(root_dir)
     if not root_path.is_dir():
@@ -253,57 +385,17 @@ def main(
     for episode_idx, episode_dir in enumerate(episode_dirs, start=1):
         print(f"处理 episode {episode_idx}/{len(episode_dirs)}: {episode_dir.name}")
         try:
-            metadata = load_metadata(episode_dir)
-            episode_task = metadata.get("prompt") or metadata.get("task") or metadata.get("recipe_name") or task
-            state_pos, actions = load_state(
+            steps = convert_episode(
                 episode_dir,
+                dataset=dataset,
+                task=task,
+                dry_run=dry_run,
                 joints_in_degrees=joints_in_degrees,
                 gripper_scale=gripper_scale,
+                max_length_delta=max_length_delta,
             )
-            timestamps = np.load(episode_dir / "timestamps.npy")
-
-            video_lengths = {
-                key: get_video_frame_count(episode_dir / filename)
-                for key, filename in VIDEO_FILES.items()
-            }
-            lengths = [len(state_pos), len(actions), len(timestamps), *video_lengths.values()]
-            if len(set(lengths)) > 1:
-                print(f"警告: 数据长度不一致 {lengths}，跳过此 episode")
-                error_num += 1
-                continue
-
-            if dry_run:
-                print(
-                    f"  OK: steps={len(state_pos)}, state_shape={state_pos.shape}, "
-                    f"video_lengths={video_lengths}, task={episode_task!r}"
-                )
-                succ_num += 1
-                continue
-
-            assert dataset is not None
-            video_frames = {
-                key: extract_video_to_frames(episode_dir / filename)
-                for key, filename in VIDEO_FILES.items()
-            }
-            decoded_lengths = [len(state_pos), len(actions), len(timestamps), *(len(frames) for frames in video_frames.values())]
-            if len(set(decoded_lengths)) > 1:
-                print(f"警告: 解码后数据长度不一致 {decoded_lengths}，跳过此 episode")
-                error_num += 1
-                continue
-
-            for step_idx in range(len(timestamps)):
-                frame_data = {
-                    "observation.images.cam_high": video_frames["observation.images.cam_high"][step_idx],
-                    "observation.images.cam_left_wrist": video_frames["observation.images.cam_left_wrist"][step_idx],
-                    "observation.images.cam_right_wrist": video_frames["observation.images.cam_right_wrist"][step_idx],
-                    "observation.state": state_pos[step_idx],
-                    "actions": actions[step_idx],
-                    "task": episode_task,
-                }
-                dataset.add_frame(frame_data)
-            dataset.save_episode()
             succ_num += 1
-            print(f"  {episode_dir} 处理成功，总计成功 {succ_num} 个")
+            print(f"  {episode_dir} 处理成功，steps={steps}，总计成功 {succ_num} 个")
         except Exception as e:
             error_num += 1
             print(f"处理 episode 时出错 {episode_dir}: {e}，总计错误 {error_num} 个")

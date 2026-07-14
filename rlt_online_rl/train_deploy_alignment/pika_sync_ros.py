@@ -1187,6 +1187,48 @@ class PikaChunkEnvAdapter:
                 float(system.env_driver.control_frequency_hz),
                 observation_capture_interval,
             )
+        self._chunk_boundary_observation_delay_sec = max(
+            float(getattr(system.env_driver, "chunk_boundary_observation_delay_sec", 0.0)),
+            0.0,
+        )
+        self._chunk_boundary_settle_tolerance = max(
+            float(getattr(system.env_driver, "chunk_boundary_settle_tolerance", 0.0)),
+            0.0,
+        )
+        self._chunk_boundary_settle_timeout_sec = max(
+            float(getattr(system.env_driver, "chunk_boundary_settle_timeout_sec", 0.0)),
+            0.0,
+        )
+        self._chunk_boundary_settle_poll_sec = max(
+            float(getattr(system.env_driver, "chunk_boundary_settle_poll_sec", 0.02)),
+            0.001,
+        )
+        self._chunk_start_reanchor_steps = max(
+            int(getattr(system.env_driver, "chunk_start_reanchor_steps", 0)),
+            0,
+        )
+        profile_indices = getattr(system.env_driver, "ref_chunk_smoothing_indices", None)
+        if profile_indices is None:
+            self._action_profile_indices = np.arange(system.rl.action_dim, dtype=np.int64)
+        else:
+            self._action_profile_indices = np.asarray(profile_indices, dtype=np.int64)
+            self._action_profile_indices = self._action_profile_indices[
+                (self._action_profile_indices >= 0) & (self._action_profile_indices < system.rl.action_dim)
+            ]
+        if self._chunk_boundary_observation_delay_sec > 0.0:
+            logger.info(
+                "Chunk boundary observation delay enabled: %.3fs",
+                self._chunk_boundary_observation_delay_sec,
+            )
+        if self._chunk_boundary_settle_tolerance > 0.0 and self._chunk_boundary_settle_timeout_sec > 0.0:
+            logger.info(
+                "Chunk boundary settling enabled: tolerance=%.4f timeout=%.3fs poll=%.3fs",
+                self._chunk_boundary_settle_tolerance,
+                self._chunk_boundary_settle_timeout_sec,
+                self._chunk_boundary_settle_poll_sec,
+            )
+        if self._chunk_start_reanchor_steps > 0:
+            logger.info("Chunk start action re-anchor enabled: steps=%d", self._chunk_start_reanchor_steps)
         self._auto_critical_gate = self._create_auto_critical_gate()
         self._last_observed_critical = self._runtime_context.in_critical_phase()
         self._reset_done_for_next_episode = False
@@ -1211,6 +1253,9 @@ class PikaChunkEnvAdapter:
         self._runtime_context.wait_for_next_episode_request()
         locked_mode = self._runtime_context.lock_episode_critical_policy_mode()
         logger.info("Episode critical policy mode=%s", locked_mode)
+        reset_control_state = getattr(self._robot, "reset_control_state", None)
+        if callable(reset_control_state):
+            reset_control_state()
         self._apply_episode_start_control_mode()
         observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
         self._last_observed_critical = self._runtime_context.in_critical_phase()
@@ -1343,7 +1388,7 @@ class PikaChunkEnvAdapter:
             1,
         )
 
-        observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
+        observation = self._get_chunk_start_observation()
         critical_started = self._update_auto_critical_gate(
             observation,
             current_critical=self._runtime_context.in_critical_phase(),
@@ -1379,6 +1424,16 @@ class PikaChunkEnvAdapter:
                 if current_plan is None or plan_cursor >= current_plan.action_chunk.shape[0]:
                     current_plan = policy_planner(step_observation, local_step)
                     plan_cursor = 0
+                    self._log_policy_boundary_observation(
+                        step_observation,
+                        current_plan,
+                        local_step=local_step,
+                    )
+                    if local_step == 0:
+                        self._log_action_chunk_profile("plan_raw", current_plan.action_chunk)
+                    if local_step == 0:
+                        current_plan = self._maybe_reanchor_chunk_start(current_plan)
+                        self._log_action_chunk_profile("plan_exec", current_plan.action_chunk)
                     if current_plan.source != int(TransitionSource.HUMAN):
                         if local_step == 0:
                             chunk_start_features = current_plan.start_features
@@ -1397,6 +1452,7 @@ class PikaChunkEnvAdapter:
                     executed_action = bounded
                 else:
                     executed_action = np.asarray(sent_action, dtype=np.float32)[: self._system.rl.action_dim]
+                    self._last_sent_action = executed_action.copy()
                 executed.append(executed_action)
                 ref_actions.append(
                     np.asarray(current_plan.ref_chunk[plan_cursor], dtype=np.float32)[: self._system.rl.action_dim]
@@ -1412,6 +1468,13 @@ class PikaChunkEnvAdapter:
                 human_controlled.append(True)
                 step_sources.append(int(TransitionSource.HUMAN))
                 actor_param_versions.append(-1)
+            elapsed = time.perf_counter() - tick_start
+            remaining = period - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            else:
+                control_overrun_count += 1
+                control_overrun_max_s = max(control_overrun_max_s, -remaining)
             should_capture_observation = (
                 local_step == horizon - 1
                 or ((local_step + 1) % observation_capture_interval == 0)
@@ -1422,19 +1485,14 @@ class PikaChunkEnvAdapter:
                 captured_observation_count += 1
             else:
                 step_observations.append(step_observations[-1])
-            elapsed = time.perf_counter() - tick_start
-            remaining = period - elapsed
-            if remaining > 0:
-                time.sleep(remaining)
-            else:
-                control_overrun_count += 1
-                control_overrun_max_s = max(control_overrun_max_s, -remaining)
 
         next_observation = (
             step_observations[-1]
             if step_observations
             else self._robot.get_observation(self._resize_hw, self._task_state.get())
         )
+        if executed:
+            self._log_action_chunk_profile("executed", np.asarray(executed, dtype=np.float32))
         if control_overrun_count:
             logger.warning(
                 "Chunk control loop overran target period %.4fs on %d/%d ticks; max_overrun=%.4fs "
@@ -1467,7 +1525,7 @@ class PikaChunkEnvAdapter:
             executed_steps=len(executed),
         )
         success = int(bool(self._success_fn(observation, next_observation, context)))
-        manual_score, _, _, _ = _manual_terminal_events(signal_snapshot)
+        manual_score, manual_success, manual_failure, manual_done_signal = _manual_terminal_events(signal_snapshot)
         if success and rewards and not any(float(reward) > 0.0 for reward in rewards):
             rewards[-1] = float(manual_score if manual_score > 0 else 3) / 3.0
             logger.warning(
@@ -1515,6 +1573,21 @@ class PikaChunkEnvAdapter:
         self._episode_chunk_step += 1
         done = bool(terminal_requested or (self._episode_chunk_step >= self._max_chunk_steps_per_episode))
         if done:
+            logger.warning(
+                "Episode terminal requested: terminal_requested=%s success=%s manual_done=%s "
+                "manual_score=%s manual_success=%s manual_failure=%s manual_done_signal=%s "
+                "episode_chunk_step=%s max_chunk_steps=%s signal_snapshot=%s",
+                terminal_requested,
+                success,
+                manual_done,
+                manual_score,
+                manual_success,
+                manual_failure,
+                manual_done_signal,
+                self._episode_chunk_step,
+                self._max_chunk_steps_per_episode,
+                signal_snapshot,
+            )
             self._finish_episode_and_reset_robot()
         if step_trace:
             step_trace[-1]["done"] = done
@@ -1710,6 +1783,164 @@ class PikaChunkEnvAdapter:
         bounded = self._last_sent_action + delta
         self._last_sent_action = bounded.copy()
         return bounded
+
+    def _get_chunk_start_observation(self) -> dict[str, Any]:
+        if self._episode_chunk_step <= 0:
+            return self._robot.get_observation(self._resize_hw, self._task_state.get())
+
+        if self._chunk_boundary_observation_delay_sec > 0.0:
+            time.sleep(self._chunk_boundary_observation_delay_sec)
+
+        observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
+        last_sent = self._last_sent_action
+        if (
+            last_sent is None
+            or self._chunk_boundary_settle_tolerance <= 0.0
+            or self._chunk_boundary_settle_timeout_sec <= 0.0
+        ):
+            return observation
+
+        target = np.asarray(last_sent, dtype=np.float32).reshape(-1)[: self._system.rl.action_dim]
+        if target.shape[0] != self._system.rl.action_dim:
+            return observation
+
+        start = time.monotonic()
+        best_error = float("inf")
+        best_observation = observation
+        polls = 0
+        while True:
+            state = np.asarray(observation.get("state"), dtype=np.float32).reshape(-1)[: self._system.rl.action_dim]
+            if state.shape[0] != self._system.rl.action_dim:
+                return observation
+            error = float(np.max(np.abs(state - target)))
+            if error < best_error:
+                best_error = error
+                best_observation = observation
+            if error <= self._chunk_boundary_settle_tolerance:
+                if polls > 0:
+                    logger.info(
+                        "Chunk boundary settled chunk=%d polls=%d elapsed=%.3fs max_error=%.4f",
+                        self._episode_chunk_step,
+                        polls,
+                        time.monotonic() - start,
+                        error,
+                    )
+                return observation
+            elapsed = time.monotonic() - start
+            if elapsed >= self._chunk_boundary_settle_timeout_sec:
+                logger.warning(
+                    "Chunk boundary did not settle chunk=%d polls=%d elapsed=%.3fs "
+                    "best_max_error=%.4f last_max_error=%.4f tolerance=%.4f",
+                    self._episode_chunk_step,
+                    polls,
+                    elapsed,
+                    best_error,
+                    error,
+                    self._chunk_boundary_settle_tolerance,
+                )
+                return best_observation
+            time.sleep(self._chunk_boundary_settle_poll_sec)
+            observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
+            polls += 1
+
+    def _log_policy_boundary_observation(
+        self,
+        observation: dict[str, Any],
+        plan: PolicyPlan,
+        *,
+        local_step: int,
+    ) -> None:
+        if local_step != 0:
+            return
+        state = np.asarray(observation.get("state"), dtype=np.float32).reshape(-1)[: self._system.rl.action_dim]
+        ref_chunk = np.asarray(plan.ref_chunk, dtype=np.float32)
+        if state.shape[0] != self._system.rl.action_dim or ref_chunk.ndim != 2 or ref_chunk.shape[0] == 0:
+            return
+        ref0 = ref_chunk[0, : self._system.rl.action_dim]
+        last_sent = self._last_sent_action
+        if last_sent is None or np.asarray(last_sent).shape[0] < self._system.rl.action_dim:
+            logger.info(
+                "Policy boundary observation chunk=%d source=%s obs_norm=%.6f ref0_minus_obs_max=%.6f",
+                self._episode_chunk_step,
+                int(plan.source),
+                float(np.linalg.norm(state)),
+                float(np.max(np.abs(ref0 - state))),
+            )
+            return
+        last_sent = np.asarray(last_sent, dtype=np.float32)[: self._system.rl.action_dim]
+        obs_minus_last = state - last_sent
+        ref0_minus_obs = ref0 - state
+        ref0_minus_last = ref0 - last_sent
+        logger.info(
+            "Policy boundary observation chunk=%d source=%s "
+            "obs_minus_last_sent_max=%.6f obs_minus_last_sent_l2=%.6f "
+            "ref0_minus_obs_max=%.6f ref0_minus_last_sent_max=%.6f",
+            self._episode_chunk_step,
+            int(plan.source),
+            float(np.max(np.abs(obs_minus_last))),
+            float(np.linalg.norm(obs_minus_last)),
+            float(np.max(np.abs(ref0_minus_obs))),
+            float(np.max(np.abs(ref0_minus_last))),
+        )
+
+    def _maybe_reanchor_chunk_start(self, plan: PolicyPlan) -> PolicyPlan:
+        if self._chunk_start_reanchor_steps <= 0 or int(plan.source) == int(TransitionSource.HUMAN):
+            return plan
+        latest_observation = self._robot.get_observation(self._resize_hw, self._task_state.get())
+        state = np.asarray(latest_observation.get("state"), dtype=np.float32).reshape(-1)[: self._system.rl.action_dim]
+        if state.shape[0] != self._system.rl.action_dim:
+            return plan
+        reset_control_state = getattr(self._robot, "reset_control_state", None)
+        if callable(reset_control_state):
+            reset_control_state()
+        self._last_sent_action = state.copy()
+
+        action_chunk = np.asarray(plan.action_chunk, dtype=np.float32).copy()
+        original = action_chunk[:, : self._system.rl.action_dim].copy()
+        steps = min(int(self._chunk_start_reanchor_steps), int(action_chunk.shape[0]))
+        offset = state - original[0]
+        action_chunk[:, : self._system.rl.action_dim] = original + offset
+        first_delta = float(np.max(np.abs(offset)))
+        persistent_offset = float(np.max(np.abs(action_chunk[steps - 1, : self._system.rl.action_dim] - original[steps - 1])))
+        logger.info(
+            "Chunk start re-anchored chunk=%d steps=%d first_delta=%.4f persistent_offset=%.4f",
+            self._episode_chunk_step,
+            steps,
+            first_delta,
+            persistent_offset,
+        )
+        return dataclasses.replace(plan, action_chunk=action_chunk)
+
+    def _log_action_chunk_profile(self, label: str, action_chunk: np.ndarray) -> None:
+        chunk = np.asarray(action_chunk, dtype=np.float32)
+        if chunk.ndim != 2 or chunk.shape[0] < 2:
+            return
+        indices = self._action_profile_indices
+        if indices.size == 0:
+            return
+        chunk = chunk[:, indices]
+        deltas = np.abs(np.diff(chunk, axis=0))
+        step_delta = np.max(deltas, axis=1)
+        split = max(1, min(int(np.ceil(step_delta.shape[0] * 0.6)), step_delta.shape[0] - 1))
+        prefix = step_delta[:split]
+        tail = step_delta[split:]
+        prefix_mean = float(np.mean(prefix)) if prefix.size else 0.0
+        prefix_max = float(np.max(prefix)) if prefix.size else 0.0
+        tail_mean = float(np.mean(tail)) if tail.size else 0.0
+        tail_max = float(np.max(tail)) if tail.size else 0.0
+        ratio = tail_mean / max(prefix_mean, 1e-6)
+        logger.info(
+            "Chunk action profile chunk=%d label=%s steps=%d prefix_mean=%.4f prefix_max=%.4f "
+            "tail_mean=%.4f tail_max=%.4f tail_over_prefix=%.3f",
+            self._episode_chunk_step,
+            label,
+            int(chunk.shape[0]),
+            prefix_mean,
+            prefix_max,
+            tail_mean,
+            tail_max,
+            ratio,
+        )
 
     def _sample_latest_human_action(self, observation: dict[str, Any]) -> np.ndarray:
         latest_action, latest_seq = self._human_action_recorder.snapshot_latest()
