@@ -506,6 +506,22 @@ class MultiRealSenseImageRecorder:
         exposure, gain = self._camera_settings(key)
         if exposure is None and gain is None:
             return
+
+        def set_and_verify(sensor: Any, option: Any, value: float, label: str) -> float:
+            if not sensor.supports(option):
+                raise RuntimeError(f"{label} is unsupported")
+            option_range = sensor.get_option_range(option)
+            if not option_range.min <= value <= option_range.max:
+                raise ValueError(
+                    f"{label}={value} is outside the supported range "
+                    f"[{option_range.min}, {option_range.max}]"
+                )
+            sensor.set_option(option, value)
+            actual = float(sensor.get_option(option))
+            if not np.isclose(actual, value):
+                raise RuntimeError(f"{label} readback={actual}, requested={value}")
+            return actual
+
         try:
             device = profile.get_device()
             color_sensor = None
@@ -519,12 +535,19 @@ class MultiRealSenseImageRecorder:
                 return
             if exposure is not None and color_sensor.supports(rs.option.enable_auto_exposure):
                 color_sensor.set_option(rs.option.enable_auto_exposure, 0)
-            if exposure is not None and color_sensor.supports(rs.option.exposure):
-                color_sensor.set_option(rs.option.exposure, float(exposure))
-            if gain is not None and color_sensor.supports(rs.option.gain):
-                color_sensor.set_option(rs.option.gain, float(gain))
+            actual_exposure = (
+                set_and_verify(color_sensor, rs.option.exposure, float(exposure), "exposure")
+                if exposure is not None
+                else None
+            )
+            actual_gain = (
+                set_and_verify(color_sensor, rs.option.gain, float(gain), "gain")
+                if gain is not None
+                else None
+            )
             print(
-                f"[MultiRealSenseImageRecorder] {key} settings exposure={exposure} gain={gain}",
+                f"[MultiRealSenseImageRecorder] {key} serial={serial} settings verified "
+                f"exposure={actual_exposure} gain={actual_gain}",
                 flush=True,
             )
         except Exception as exc:

@@ -61,7 +61,10 @@ def default_data_root(script_root, repo_root):
             return validate_data_root(candidate)
         except Exception:
             continue
-    return Path.cwd().resolve()
+    # A replay directory is selected from the viewer when no conventional
+    # location is available.  Do not make starting the web server depend on
+    # the current working directory containing replay data.
+    return None
 
 
 REPO_ROOT = find_repo_root(ROOT)
@@ -95,7 +98,8 @@ def set_data_root(path):
     global DATA_ROOT
     keep_root = None
     try:
-        keep_root = DATA_ROOT.resolve()
+        if DATA_ROOT is not None:
+            keep_root = DATA_ROOT.resolve()
     except Exception:
         keep_root = None
     cleanup_import_dirs(keep_root=keep_root)
@@ -111,6 +115,13 @@ def set_data_root(path):
 def get_data_root():
     with DATA_LOCK:
         return DATA_ROOT
+
+
+def require_data_root():
+    root = get_data_root()
+    if root is None:
+        raise RuntimeError("尚未选择 replay 目录；请在页面左上角选择目录后点击“打开”")
+    return root
 
 
 def natural_episode_key(path):
@@ -132,7 +143,7 @@ def iter_pickle_stream(path):
 
 @functools.lru_cache(maxsize=1)
 def load_journal():
-    return list(iter_pickle_stream(get_data_root() / "replay_journal.pkl"))
+    return list(iter_pickle_stream(require_data_root() / "replay_journal.pkl"))
 
 
 @functools.lru_cache(maxsize=2)
@@ -143,7 +154,7 @@ def load_episode(name):
 
 
 def safe_episode_path(name):
-    base = (get_data_root() / "episodes").resolve()
+    base = (require_data_root() / "episodes").resolve()
     path = (base / name).resolve()
     if not str(path).startswith(str(base)) or path.suffix != ".pkl" or not path.exists():
         raise FileNotFoundError(name)
@@ -486,7 +497,8 @@ def index():
 
 @app.get("/api/current-root")
 def current_root():
-    return jsonify({"root": str(get_data_root())})
+    root = get_data_root()
+    return jsonify({"root": str(root) if root is not None else "", "configured": root is not None})
 
 
 @app.post("/api/set-data-root")
@@ -502,7 +514,8 @@ def set_data_root_api():
 
 @app.get("/api/pick-directory")
 def pick_directory_api():
-    initial_dir = str(get_data_root())
+    initial_root = get_data_root()
+    initial_dir = str(initial_root if initial_root is not None else Path.cwd())
     picker_commands = []
     if shutil.which("zenity"):
         picker_commands.append(
@@ -585,7 +598,7 @@ def import_picked_root_api():
 
 @app.get("/api/summary")
 def summary():
-    data_root = get_data_root()
+    data_root = require_data_root()
     eps = []
     for p in sorted((data_root / "episodes").glob("*.pkl"), key=natural_episode_key):
         eps.append({"name": p.name, "size_mb": round(p.stat().st_size / 1024 / 1024, 2), "mtime": p.stat().st_mtime})
@@ -757,8 +770,9 @@ def search():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default=str(DATA_ROOT))
+    parser.add_argument("--data-dir", default=None, help="可选：启动时直接打开的 replay 目录")
     args = parser.parse_args()
-    set_data_root(args.data_dir)
+    if args.data_dir:
+        set_data_root(args.data_dir)
     port = int(os.environ.get("PORT", "7860"))
     app.run(host="127.0.0.1", port=port, threaded=True)

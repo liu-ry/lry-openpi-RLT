@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 import tyro
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.compute_stats import sample_indices
 
 
 ARM_DOF = 7
@@ -130,6 +131,92 @@ def trim_frames(frames: list[np.ndarray], length: int) -> list[np.ndarray]:
     return frames[:length]
 
 
+def save_episode_with_source_videos(
+    dataset: LeRobotDataset,
+    *,
+    episode_dir: Path,
+    state_pos: np.ndarray,
+    actions: np.ndarray,
+    task: str,
+) -> None:
+    """Save parquet metadata and copy MP4s without decoding frames to temporary PNGs.
+
+    ``LeRobotDataset.add_frame`` writes every video frame as a temporary PNG even
+    when the final MP4 already exists.  Supplying the episode buffer directly is
+    safe here because ``save_episode`` stores video fields outside Parquet and
+    only requires their final MP4 files to exist before it runs.
+    """
+    episode_index = dataset.meta.total_episodes
+    episode_length = len(state_pos)
+    episode_buffer = dataset.create_episode_buffer(episode_index=episode_index)
+    episode_buffer["size"] = episode_length
+    episode_buffer["task"] = [task] * episode_length
+    episode_buffer["frame_index"] = list(range(episode_length))
+    episode_buffer["timestamp"] = [frame_index / dataset.fps for frame_index in range(episode_length)]
+    episode_buffer["observation.state"] = list(state_pos)
+    episode_buffer["actions"] = list(actions)
+
+    # LeRobot calculates image normalization statistics from the temporary
+    # image paths in the episode buffer.  Preserve correct statistics while
+    # only decoding/writing its sampled frames (rather than every frame).
+    for key, filename in VIDEO_FILES.items():
+        target_path = dataset.root / dataset.meta.get_video_file_path(episode_index, key)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(episode_dir / filename, target_path)
+        episode_buffer[key] = extract_video_stat_samples(
+            episode_dir / filename,
+            dataset=dataset,
+            episode_index=episode_index,
+            video_key=key,
+            frame_count=episode_length,
+        )
+
+    dataset.episode_buffer = episode_buffer
+    dataset.save_episode()
+
+
+def extract_video_stat_samples(
+    video_path: Path,
+    *,
+    dataset: LeRobotDataset,
+    episode_index: int,
+    video_key: str,
+    frame_count: int,
+) -> list[str]:
+    """Write only the frames LeRobot samples for per-episode image statistics."""
+    sampled_indices = set(sample_indices(frame_count))
+    first_sample_path: Path | None = None
+    frame_paths: list[str | None] = [None] * frame_count
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"无法打开视频文件: {video_path}")
+
+    try:
+        for frame_index in range(frame_count):
+            if not cap.grab():
+                raise ValueError(f"读取视频帧失败: {video_path}, frame={frame_index}")
+            if frame_index not in sampled_indices:
+                continue
+            ok, frame = cap.retrieve()
+            if not ok:
+                raise ValueError(f"读取视频帧失败: {video_path}, frame={frame_index}")
+            image_path = dataset._get_image_file_path(episode_index, video_key, frame_index)
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(image_path), frame):
+                raise ValueError(f"写入统计采样帧失败: {image_path}")
+            frame_paths[frame_index] = str(image_path)
+            if first_sample_path is None:
+                first_sample_path = image_path
+    finally:
+        cap.release()
+
+    if first_sample_path is None:
+        raise ValueError(f"视频中没有可用于统计的帧: {video_path}")
+    # save_episode only reads the indices returned by sample_indices(). The
+    # remaining entries must merely be valid paths for its episode buffer.
+    return [path or str(first_sample_path) for path in frame_paths]
+
+
 def get_action_from_state_pos(state_pos: np.ndarray) -> np.ndarray:
     if len(state_pos) < 2:
         raise ValueError("episode 至少需要 2 帧才能构造下一帧动作")
@@ -218,6 +305,7 @@ def convert_episode(
     dry_run: bool,
     joints_in_degrees: bool,
     gripper_scale: float,
+    copy_source_videos: bool,
     max_length_delta: int = DEFAULT_MAX_LENGTH_DELTA,
 ) -> int:
     metadata = load_metadata(episode_dir)
@@ -253,10 +341,18 @@ def convert_episode(
     if dataset is None:
         raise ValueError("dataset 不能为空，除非 dry_run=True")
 
-    video_frames = {
-        key: extract_video_to_frames(episode_dir / filename)
-        for key, filename in VIDEO_FILES.items()
-    }
+    if copy_source_videos:
+        save_episode_with_source_videos(
+            dataset,
+            episode_dir=episode_dir,
+            state_pos=state_pos,
+            actions=actions,
+            task=episode_task,
+        )
+        return target_length
+
+    # Compatibility path for source videos that need to be re-encoded.
+    video_frames = {key: extract_video_to_frames(episode_dir / filename) for key, filename in VIDEO_FILES.items()}
     decoded_lengths = {
         "state": len(state_pos),
         "actions": len(actions),
@@ -272,35 +368,36 @@ def convert_episode(
         print(f"  警告: 解码后数据长度不一致 {decoded_lengths}，裁剪到 {decoded_target_length} 帧")
         state_pos = trim_array(state_pos, decoded_target_length)
         actions = trim_array(actions, decoded_target_length)
-        timestamps = trim_array(timestamps, decoded_target_length)
         video_frames = {key: trim_frames(frames, decoded_target_length) for key, frames in video_frames.items()}
         target_length = decoded_target_length
 
     for step_idx in range(target_length):
-        frame_data = {
-            "observation.images.cam_high": video_frames["observation.images.cam_high"][step_idx],
-            "observation.images.cam_left_wrist": video_frames["observation.images.cam_left_wrist"][step_idx],
-            "observation.images.cam_right_wrist": video_frames["observation.images.cam_right_wrist"][step_idx],
-            "observation.state": state_pos[step_idx],
-            "actions": actions[step_idx],
-            "task": episode_task,
-        }
-        dataset.add_frame(frame_data)
+        dataset.add_frame(
+            {
+                "observation.images.cam_high": video_frames["observation.images.cam_high"][step_idx],
+                "observation.images.cam_left_wrist": video_frames["observation.images.cam_left_wrist"][step_idx],
+                "observation.images.cam_right_wrist": video_frames["observation.images.cam_right_wrist"][step_idx],
+                "observation.state": state_pos[step_idx],
+                "actions": actions[step_idx],
+                "task": episode_task,
+            }
+        )
     dataset.save_episode()
     return target_length
 
 
-def create_dataset(output_dir: str, fps: int) -> LeRobotDataset:
-    image_features = {
+def create_dataset(output_dir: str, fps: int, image_writer_threads: int) -> LeRobotDataset:
+    video_features = {
         key: {
-            "dtype": "image",
+            # Store camera streams as MP4, not raw image bytes in Parquet.
+            "dtype": "video",
             "shape": (IMAGE_HEIGHT, IMAGE_WIDTH, 3),
             "names": ["height", "width", "channel"],
         }
         for key in VIDEO_FILES
     }
     features = {
-        **image_features,
+        **video_features,
         "observation.state": {
             "dtype": "float32",
             "shape": (STATE_DIM,),
@@ -317,8 +414,10 @@ def create_dataset(output_dir: str, fps: int) -> LeRobotDataset:
         robot_type="rokae_zhixing_dual",
         fps=fps,
         features=features,
-        image_writer_threads=10,
-        image_writer_processes=5,
+        # Keep image arrays in this process. Multiprocessing serializes every
+        # frame into an unbounded queue and was the cause of the 24 GiB OOM.
+        image_writer_threads=image_writer_threads,
+        image_writer_processes=0,
     )
 
 
@@ -348,6 +447,8 @@ def main(
     dry_run: bool = False,
     joints_in_degrees: bool = False,
     gripper_scale: float = 1.0,
+    image_writer_threads: int = 4,
+    copy_source_videos: bool = True,
     max_length_delta: int = DEFAULT_MAX_LENGTH_DELTA,
 ) -> None:
     """Convert /home/lry/RokaeDual style episodes to LeRobot.
@@ -362,6 +463,8 @@ def main(
         dry_run: Validate files, shapes, and lengths without writing output.
         joints_in_degrees: Convert joint arrays from degrees to radians when enabled.
         gripper_scale: Scale gripper width values. Default keeps raw values unchanged.
+        image_writer_threads: Number of in-process temporary-image writer threads.
+        copy_source_videos: Copy already-compatible source MP4s instead of re-encoding them.
         max_length_delta: Accept length mismatches up to this many frames and trim all modalities to the shortest length.
     """
     root_path = Path(root_dir)
@@ -373,12 +476,14 @@ def main(
         episode_dirs = episode_dirs[:max_episodes]
     if not episode_dirs:
         raise ValueError(f"未在 {root_path} 下找到 episode_* 目录")
+    if image_writer_threads < 1:
+        raise ValueError("image_writer_threads 至少为 1")
 
     dataset = None
     if not dry_run:
         if not ensure_clean_output(output_dir, overwrite=overwrite):
             return
-        dataset = create_dataset(output_dir, fps)
+        dataset = create_dataset(output_dir, fps, image_writer_threads)
 
     succ_num = 0
     error_num = 0
@@ -392,6 +497,7 @@ def main(
                 dry_run=dry_run,
                 joints_in_degrees=joints_in_degrees,
                 gripper_scale=gripper_scale,
+                copy_source_videos=copy_source_videos,
                 max_length_delta=max_length_delta,
             )
             succ_num += 1

@@ -32,10 +32,12 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -78,14 +80,62 @@ def _load_parquet_episode(parquet_path: Path) -> pd.DataFrame:
     return pd.read_parquet(str(parquet_path))
 
 
-def _build_obs_dict(row: pd.Series, image_keys: list[str]) -> dict[str, Any]:
+class _EpisodeVideoReader:
+    """Sequentially decode LeRobot `dtype: video` camera streams for one episode."""
+
+    def __init__(
+        self,
+        dataset_dir: Path,
+        episode_index: int,
+        image_keys: list[str],
+        *,
+        chunks_size: int,
+        video_path_template: str,
+    ) -> None:
+        self._captures: dict[str, cv2.VideoCapture] = {}
+        try:
+            for key in image_keys:
+                video_path = dataset_dir / video_path_template.format(
+                    episode_chunk=episode_index // chunks_size,
+                    video_key=f"observation.images.{key}",
+                    episode_index=episode_index,
+                )
+                cap = cv2.VideoCapture(str(video_path))
+                if not cap.isOpened():
+                    cap.release()
+                    raise ValueError(f"无法打开 episode {episode_index} 的视频: {video_path}")
+                self._captures[key] = cap
+        except Exception:
+            self.close()
+            raise
+
+    def read(self, key: str) -> np.ndarray:
+        ret, frame = self._captures[key].read()
+        if not ret or frame is None:
+            raise ValueError(f"视频 {key} 的帧数少于对应 Parquet episode 的步数")
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    def close(self) -> None:
+        for cap in self._captures.values():
+            cap.release()
+        self._captures.clear()
+
+
+def _build_obs_dict(
+    row: pd.Series,
+    image_keys: list[str],
+    video_reader: _EpisodeVideoReader | None = None,
+) -> dict[str, Any]:
     """Build the observation dict expected by the RLT policy server."""
     state = np.asarray(row["observation.state"], dtype=np.float32)
     images: dict[str, np.ndarray] = {}
     for key in image_keys:
-        col = f"observation.images.{key}"
-        if col in row.index and row[col] is not None:
-            images[key] = _decode_image(row[col])
+        if video_reader is not None:
+            images[key] = video_reader.read(key)
+        else:
+            col = f"observation.images.{key}"
+            if col in row.index and row[col] is not None:
+                images[key] = _decode_image(row[col])
     return {"state": state, "images": images}
 
 
@@ -214,6 +264,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     dataset_dir = args.dataset_dir
     data_dir = dataset_dir / "data"
+    info_path = dataset_dir / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"LeRobot metadata not found: {info_path}")
+    dataset_info = json.loads(info_path.read_text())
+    video_feature_keys = {
+        key.removeprefix("observation.images.")
+        for key, feature in dataset_info["features"].items()
+        if key.startswith("observation.images.") and feature.get("dtype") == "video"
+    }
+    chunks_size = int(dataset_info["chunks_size"])
+    video_path_template = dataset_info["video_path"]
     parquet_files = sorted(data_dir.glob("**/*.parquet"))
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found under {data_dir}")
@@ -309,17 +370,35 @@ def main() -> None:
         # Determine available image keys for this episode
         available_image_keys = [
             k for k in args.image_keys
-            if f"observation.images.{k}" in df.columns
+            if k in video_feature_keys or f"observation.images.{k}" in df.columns
         ]
         if not available_image_keys:
             print(f"  WARNING: No image columns found, available columns: {df.columns.tolist()}")
 
         # Build all obs dicts for the episode
         all_obs: list[dict[str, Any]] = []
-        for i in range(n_steps):
-            row = df.iloc[i]
-            obs = _build_obs_dict(row, available_image_keys)
-            all_obs.append(obs)
+        video_keys = [key for key in available_image_keys if key in video_feature_keys]
+        video_reader = (
+            _EpisodeVideoReader(
+                dataset_dir,
+                ep_idx,
+                video_keys,
+                chunks_size=chunks_size,
+                video_path_template=video_path_template,
+            )
+            if video_keys
+            else None
+        )
+        try:
+            for i in range(n_steps):
+                row = df.iloc[i]
+                if video_reader is not None and len(video_keys) != len(available_image_keys):
+                    raise ValueError("单个回放任务不能混用 `image` 与 `video` 相机特征")
+                obs = _build_obs_dict(row, available_image_keys, video_reader)
+                all_obs.append(obs)
+        finally:
+            if video_reader is not None:
+                video_reader.close()
 
         # Query server in batches to get (z_rl, proprio, ref_chunk) for each step
         print(f"  Querying policy server in batches of {args.batch_size} ...")
